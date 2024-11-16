@@ -3,7 +3,6 @@ from bcc import BPF
 from time import sleep
 import argparse
 import os
-import torch.profiler as profiler
 import threading
 import time
 from pathlib import Path
@@ -30,6 +29,8 @@ struct io_data_t {
     u64 offset;
     u64 flags;
     char comm[16];
+    char fname[256];    // Add filename field
+    char syscall[16];   // Add syscall name
 };
 
 // Maps to store data
@@ -62,7 +63,13 @@ static int get_filename(int fd, char *buf, size_t size) {
     return 0;
 }
 
-// Track file opens
+// Get full file path
+static int get_path(struct pt_regs *ctx, const char __user *filename, char *path) {
+    bpf_probe_read_user_str(path, 256, filename);
+    return 0;
+}
+
+// Modified open tracking
 int trace_open_enter(struct pt_regs *ctx, const char __user *filename, int flags) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
@@ -70,7 +77,9 @@ int trace_open_enter(struct pt_regs *ctx, const char __user *filename, int flags
         
     struct fd_info_t fd_data = {};
     fd_data.pid = pid;
-    bpf_probe_read_user_str(fd_data.name, sizeof(fd_data.name), filename);
+    
+    // Get full path
+    get_path(ctx, filename, fd_data.name);
     
     u64 id = bpf_get_current_pid_tgid();
     fd_info.update(&id, &fd_data);
@@ -88,7 +97,13 @@ int trace_open_return(struct pt_regs *ctx) {
         struct fd_info_t *fd_data = fd_info.lookup(&id);
         if (fd_data) {
             fd_data->fd = fd;
-            // Keep the entry updated
+            
+            // Get filename from helper
+            char fname[256];
+            if (get_filename(fd, fname, sizeof(fname)) == 0) {
+                bpf_probe_read_kernel_str(fd_data->name, sizeof(fd_data->name), fname);
+            }
+            
             fd_info.update(&id, fd_data);
         }
     }
@@ -210,6 +225,12 @@ class IOStats:
         self.phase_start = time.time()
         # Map to store file descriptors to names
         self.fd_to_name = {}
+        self.file_offsets = {}  # Track file offsets
+
+    def update_fd_info(self, fd, name):
+        """Update fd to filename mapping"""
+        if name:
+            self.fd_to_name[fd] = name.decode('utf-8', errors='ignore') if isinstance(name, bytes) else name
 
     def add_io(self, event, filename):
         self.io_events.append({
@@ -219,7 +240,7 @@ class IOStats:
             'size': event.size,
             'offset': event.offset,
             'latency': event.ts,
-            'operation': 'read' if event.comm.startswith('read') else 'write'
+            'operation': 'read' if event.comm.startswith(b'read') else 'write'
         })
 
     def set_phase(self, phase):
@@ -286,14 +307,34 @@ class IOStats:
 
 def print_event(cpu, data, size):
     event = b["io_events"].event(data)
+
+    # Try to get filename from fd_info map
+    try:
+        fd_info_data = b["fd_info"][ctypes.c_uint64(event.pid)]
+        if fd_info_data.fd == event.fd:
+            stats.update_fd_info(event.fd, fd_info_data.name)
+    except Exception:
+        pass
+
     filename = stats.fd_to_name.get(event.fd, f"fd_{event.fd}")
 
     if event.size > 0:
-        print(f"[{stats.phase}] {event.comm} {filename} "
+        try:
+            # Get current working directory for context
+            cwd = os.readlink(f"/proc/{event.pid}/cwd")
+            # Try to make filename absolute
+            if not filename.startswith('/'):
+                filename = os.path.join(cwd, filename)
+        except Exception:
+            pass
+
+        print(f"[{stats.phase}] {event.comm.decode('utf-8', errors='ignore')} "
+              f"{filename} "
               f"Size: {event.size/1024/1024:.2f}MB "
               f"Offset: {event.offset} "
               f"Latency: {event.ts/1000000:.2f}ms")
         stats.add_io(event, filename)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -313,6 +354,8 @@ if __name__ == '__main__':
     b = BPF(text=bpf_text)
 
     # Attach probes
+    b.attach_kprobe(event="__x64_sys_openat", fn_name="trace_open_enter")
+    b.attach_kretprobe(event="__x64_sys_openat", fn_name="trace_open_return")
     b.attach_kprobe(event="__x64_sys_read", fn_name="trace_read_enter")
     b.attach_kretprobe(event="__x64_sys_read", fn_name="trace_read_return")
     b.attach_kprobe(event="__x64_sys_write", fn_name="trace_write_enter")

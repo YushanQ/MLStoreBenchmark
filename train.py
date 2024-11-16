@@ -14,56 +14,6 @@ import pandas as pd
 import os
 from contextlib import contextmanager
 
-class ProfiledSFTTrainer(SFTTrainer):
-    """Extended SFTTrainer with profiling capabilities"""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Create phase pipe for BPF communication
-        try:
-            os.mkfifo("/tmp/llama_phase")
-        except FileExistsError:
-            pass
-        self.phase_pipe = open("/tmp/llama_phase", "w")
-
-    def _mark_phase(self, phase):
-        """Helper to mark training phases"""
-        try:
-            self.phase_pipe.write(f"{phase}\n")
-            self.phase_pipe.flush()
-        except Exception as e:
-            print(f"Warning: Could not mark phase: {e}")
-
-    def training_step(self, *args, **kwargs):
-        """Override training step to add profiling"""
-        self._mark_phase("training")
-        with record_function("training_step"):
-            return super().training_step(*args, **kwargs)
-
-    def save_model(self, *args, **kwargs):
-        """Override save to track checkpoints"""
-        self._mark_phase("checkpoint")
-        with record_function("save_checkpoint"):
-            result = super().save_model(*args, **kwargs)
-        self._mark_phase("training")
-        return result
-
-    def _prepare_inputs(self, *args, **kwargs):
-        """Override input preparation to track data loading"""
-        self._mark_phase("dataload")
-        with record_function("data_loading"):
-            result = super()._prepare_inputs(*args, **kwargs)
-        self._mark_phase("training")
-        return result
-
-    def close(self):
-        """Cleanup phase pipe"""
-        if hasattr(self, 'phase_pipe'):
-            self.phase_pipe.close()
-            try:
-                os.remove("/tmp/llama_phase")
-            except FileNotFoundError:
-                pass
-
 class LlamaTrainer:
     def __init__(
             self,
@@ -72,16 +22,34 @@ class LlamaTrainer:
     ):
         self.model_id = model_id
         self.output_model = output_model
+        self.profiler = None
 
     @contextmanager
     def profile_section(self, name):
-        """Context manager for profiling sections"""
+        """Safer context manager for profiling sections"""
         try:
+            # Mark phase in pipe for BPF
+            if hasattr(self, 'phase_pipe'):
+                try:
+                    self.phase_pipe.write(f"{name}\n")
+                    self.phase_pipe.flush()
+                except Exception as e:
+                    print(f"Warning: Could not mark phase: {e}")
+
+            # Record operation in profiler
             with record_function(name):
                 yield
         except Exception as e:
             print(f"Profiling error in {name}: {e}")
-            yield
+            raise
+        finally:
+            # Reset phase if needed
+            if hasattr(self, 'phase_pipe'):
+                try:
+                    self.phase_pipe.write("unknown\n")
+                    self.phase_pipe.flush()
+                except Exception:
+                    pass
 
     def prepare_data(self, data_path):
         with self.profile_section("data_preparation"):
@@ -129,59 +97,96 @@ class LlamaTrainer:
             push_to_hub=False
         )
 
-    def train(self, data_path):
+    def setup_profiler(self):
+        """Setup PyTorch profiler"""
         try:
-            with profile(
-                    activities=[
-                        ProfilerActivity.CPU,
-                        ProfilerActivity.CUDA,
-                    ],
-                    schedule=torch.profiler.schedule(
-                        wait=1,
-                        warmup=1,
-                        active=3,
-                        repeat=2
-                    ),
-                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                        f'{self.output_model}/profile_logs'
-                    ),
-                    record_shapes=True,
-                    profile_memory=True,
-                    with_stack=True
-            ) as prof:
-                with self.profile_section("full_training"):
-                    data = self.prepare_data(data_path)
-                    model, tokenizer = self.get_model_tokenizer()
+            os.makedirs(f'{self.output_model}/profile_logs', exist_ok=True)
+            return profile(
+                activities=[
+                    ProfilerActivity.CPU,
+                    ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=1,
+                    warmup=1,
+                    active=3,
+                    repeat=2
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    f'{self.output_model}/profile_logs'
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True
+            )
+        except Exception as e:
+            print(f"Warning: Could not setup profiler: {e}")
+            return None
 
-                    peft_config = LoraConfig(
-                        r=8,
-                        lora_alpha=16,
-                        lora_dropout=0.05,
-                        bias="none",
-                        task_type="CAUSAL_LM"
-                    )
+    def train(self, data_path):
+        """Train with proper cleanup and error handling"""
+        # Setup phase pipe for BPF
+        try:
+            os.mkfifo("/tmp/llama_phase")
+        except FileExistsError:
+            pass
+        self.phase_pipe = open("/tmp/llama_phase", "w")
 
-                    trainer = ProfiledSFTTrainer(
-                        model=model,
-                        train_dataset=data,
-                        peft_config=peft_config,
-                        dataset_text_field="text",
-                        args=self.get_training_args(),
-                        tokenizer=tokenizer,
-                        packing=False,
-                        max_seq_length=1024
-                    )
+        try:
+            # Setup profiler
+            self.profiler = self.setup_profiler()
+            if self.profiler:
+                self.profiler.start()
 
-                    trainer.train()
-                    trainer.close()
+            # Training process
+            with self.profile_section("full_training"):
+                data = self.prepare_data(data_path)
+                model, tokenizer = self.get_model_tokenizer()
 
-                    # Export profiling data
-                    print("\nProfiling Summary:")
-                    print(prof.key_averages().table(
-                        sort_by="cpu_time_total", row_limit=10))
+                peft_config = LoraConfig(
+                    r=8,
+                    lora_alpha=16,
+                    lora_dropout=0.05,
+                    bias="none",
+                    task_type="CAUSAL_LM"
+                )
+
+                trainer = SFTTrainer(
+                    model=model,
+                    train_dataset=data,
+                    peft_config=peft_config,
+                    dataset_text_field="text",
+                    args=self.get_training_args(),
+                    tokenizer=tokenizer,
+                    packing=False,
+                    max_seq_length=1024
+                )
+
+                trainer.train()
+
+            # Print profiling summary if available
+            if self.profiler:
+                print("\nProfiling Summary:")
+                print(self.profiler.key_averages().table(
+                    sort_by="cpu_time_total", row_limit=10))
+
         except Exception as e:
             print(f"Training error: {e}")
             raise
+        finally:
+            # Cleanup
+            if hasattr(self, 'profiler') and self.profiler:
+                try:
+                    self.profiler.stop()
+                except Exception:
+                    pass
+
+            if hasattr(self, 'phase_pipe'):
+                try:
+                    self.phase_pipe.close()
+                    os.remove("/tmp/llama_phase")
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     trainer = LlamaTrainer()
