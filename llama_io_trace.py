@@ -137,23 +137,33 @@ int trace_read_return(struct pt_regs *ctx) {
     data.pid = pid;
     data.size = PT_REGS_RC(ctx);
     
-    // Get current offset
-    struct fd_info_t *fd_data = fd_info.lookup(&id);
-    if (fd_data) {
-        data.fd = fd_data->fd;
-        u64 *offset = file_offsets.lookup(&id);
-        if (offset)
-            data.offset = *offset;
+    // Get full file path
+    struct task_struct *task;
+    struct file *file;
+    struct dentry *dentry;
+    
+    task = (struct task_struct *)bpf_get_current_task();
+    if (task) {
+        struct files_struct *files = task->files;
+        if (files) {
+            struct fdtable *fdt = files->fdt;
+            if (fdt && data.fd < fdt->max_fds) {
+                file = fdt->fd[data.fd];
+                if (file) {
+                    dentry = file->f_path.dentry;
+                    if (dentry) {
+                        bpf_probe_read_kernel_str(data.fname, sizeof(data.fname), dentry->d_name.name);
+                    }
+                }
+            }
+        }
     }
+    
+    // Set syscall name
+    bpf_probe_read_kernel_str(data.syscall, sizeof(data.syscall), "read");
     
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     io_events.perf_submit(ctx, &data, sizeof(data));
-    
-    // Update offset
-    if (data.size > 0) {
-        u64 new_offset = data.offset + data.size;
-        file_offsets.update(&id, &new_offset);
-    }
     
     start.delete(&id);
     return 0;
@@ -232,16 +242,25 @@ class IOStats:
         if name:
             self.fd_to_name[fd] = name.decode('utf-8', errors='ignore') if isinstance(name, bytes) else name
 
-    def add_io(self, event, filename):
+    def add_io(self, event, filepath):
         self.io_events.append({
             'phase': self.phase,
             'timestamp': time.time(),
-            'filename': filename,
+            'filepath': filepath,
             'size': event.size,
             'offset': event.offset,
             'latency': event.ts,
-            'operation': 'read' if event.comm.startswith(b'read') else 'write'
+            'syscall': event.syscall.decode('utf-8', errors='ignore'),
+            'operation': 'read' if event.syscall.startswith(b'read') else 'write'
         })
+
+    def update_fd_path(self, fd, path):
+        """Update fd to full path mapping"""
+        try:
+            real_path = os.path.realpath(path)
+            self.fd_to_path[fd] = real_path
+        except Exception:
+            self.fd_to_path[fd] = path
 
     def set_phase(self, phase):
         if phase != self.phase:
@@ -308,32 +327,54 @@ class IOStats:
 def print_event(cpu, data, size):
     event = b["io_events"].event(data)
 
-    # Try to get filename from fd_info map
-    try:
-        fd_info_data = b["fd_info"][ctypes.c_uint64(event.pid)]
-        if fd_info_data.fd == event.fd:
-            stats.update_fd_info(event.fd, fd_info_data.name)
-    except Exception:
-        pass
+    # Try to get real path
+    filepath = event.fname.decode('utf-8', errors='ignore')
+    if not filepath:
+        filepath = stats.fd_to_path.get(event.fd, f"fd_{event.fd}")
 
-    filename = stats.fd_to_name.get(event.fd, f"fd_{event.fd}")
-
-    if event.size > 0:
+    # Try to make path absolute if it's not
+    if not os.path.isabs(filepath):
         try:
-            # Get current working directory for context
-            cwd = os.readlink(f"/proc/{event.pid}/cwd")
-            # Try to make filename absolute
-            if not filename.startswith('/'):
-                filename = os.path.join(cwd, filename)
+            proc_fd = f"/proc/{event.pid}/fd/{event.fd}"
+            if os.path.exists(proc_fd):
+                filepath = os.path.realpath(proc_fd)
         except Exception:
             pass
 
+    if event.size > 0 or event.syscall.startswith(b'open'):
+        syscall = event.syscall.decode('utf-8', errors='ignore')
         print(f"[{stats.phase}] {event.comm.decode('utf-8', errors='ignore')} "
-              f"{filename} "
+              f"[{syscall}] {filepath} "
               f"Size: {event.size/1024/1024:.2f}MB "
               f"Offset: {event.offset} "
               f"Latency: {event.ts/1000000:.2f}ms")
-        stats.add_io(event, filename)
+
+        # Update fd mapping on open
+        if syscall.startswith('open'):
+            stats.update_fd_path(event.fd, filepath)
+
+        stats.add_io(event, filepath)
+
+
+def monitor_phase_pipe():
+    """Monitor named pipe for phase updates"""
+    pipe_path = "/tmp/llama_phase"
+
+    while True:
+        if os.path.exists(pipe_path):
+            try:
+                with open(pipe_path, "r") as pipe:
+                    while True:
+                        phase = pipe.readline().strip()
+                        if phase:
+                            stats.set_phase(phase)
+                            print(f"\nPhase changed to: {phase}")
+            except Exception as e:
+                print(f"Phase pipe error: {e}")
+                time.sleep(1)
+        else:
+            print(f"Waiting for phase pipe at {pipe_path}...")
+            time.sleep(1)
 
 
 if __name__ == '__main__':

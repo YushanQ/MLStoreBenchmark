@@ -13,6 +13,7 @@ import json
 import pandas as pd
 import os
 from contextlib import contextmanager
+import time
 
 class LlamaTrainer:
     def __init__(
@@ -23,36 +24,38 @@ class LlamaTrainer:
         self.model_id = model_id
         self.output_model = output_model
         self.profiler = None
+        self.phase_pipe = None
+        self.current_phase = "unknown"
+
+    def mark_phase(self, phase):
+        """Explicitly mark phase for I/O monitoring"""
+        self.current_phase = phase
+        if self.phase_pipe:
+            try:
+                self.phase_pipe.write(f"{phase}\n")
+                self.phase_pipe.flush()
+                print(f"\nEntering phase: {phase}")
+            except Exception as e:
+                print(f"Warning: Could not mark phase: {e}")
 
     @contextmanager
     def profile_section(self, name):
-        """Safer context manager for profiling sections"""
-        try:
-            # Mark phase in pipe for BPF
-            if hasattr(self, 'phase_pipe'):
-                try:
-                    self.phase_pipe.write(f"{name}\n")
-                    self.phase_pipe.flush()
-                except Exception as e:
-                    print(f"Warning: Could not mark phase: {e}")
+        """Enhanced context manager for profiling sections with phase marking"""
+        previous_phase = self.current_phase
+        self.mark_phase(name)  # Mark start of section
 
-            # Record operation in profiler
+        try:
             with record_function(name):
                 yield
         except Exception as e:
             print(f"Profiling error in {name}: {e}")
             raise
         finally:
-            # Reset phase if needed
-            if hasattr(self, 'phase_pipe'):
-                try:
-                    self.phase_pipe.write("unknown\n")
-                    self.phase_pipe.flush()
-                except Exception:
-                    pass
+            self.mark_phase(previous_phase)  # Restore previous phase
 
     def prepare_data(self, data_path):
         with self.profile_section("data_preparation"):
+            print("\nPreparing training data...")
             with open(data_path, 'r') as f:
                 training_data = json.load(f)
             df = pd.DataFrame(training_data)
@@ -64,14 +67,17 @@ class LlamaTrainer:
 
     def get_model_tokenizer(self):
         with self.profile_section("model_loading"):
+            print("\nLoading model and tokenizer...")
             tokenizer = AutoTokenizer.from_pretrained(self.model_id)
             tokenizer.pad_token = tokenizer.eos_token
+
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype="float16",
                 bnb_4bit_use_double_quant=True
             )
+
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
                 quantization_config=bnb_config,
@@ -81,24 +87,25 @@ class LlamaTrainer:
             model.config.pretraining_tp = 1
             return model, tokenizer
 
-    def get_training_args(self):
-        return TrainingArguments(
-            output_dir=self.output_model,
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=16,
-            optim="paged_adamw_32bit",
-            learning_rate=2e-4,
-            lr_scheduler_type="cosine",
-            save_strategy="epoch",
-            logging_steps=10,
-            num_train_epochs=3,
-            max_steps=250,
-            fp16=True,
-            push_to_hub=False
-        )
+    def setup_training_args(self):
+        with self.profile_section("training_setup"):
+            return TrainingArguments(
+                output_dir=self.output_model,
+                per_device_train_batch_size=4,
+                gradient_accumulation_steps=16,
+                optim="paged_adamw_32bit",
+                learning_rate=2e-4,
+                lr_scheduler_type="cosine",
+                save_strategy="epoch",
+                logging_steps=10,
+                num_train_epochs=3,
+                max_steps=250,
+                fp16=True,
+                push_to_hub=False
+            )
 
     def setup_profiler(self):
-        """Setup PyTorch profiler"""
+        """Setup PyTorch profiler with phase awareness"""
         try:
             os.makedirs(f'{self.output_model}/profile_logs', exist_ok=True)
             return profile(
@@ -124,13 +131,17 @@ class LlamaTrainer:
             return None
 
     def train(self, data_path):
-        """Train with proper cleanup and error handling"""
+        """Enhanced training with detailed phase tracking"""
         # Setup phase pipe for BPF
+        pipe_path = "/tmp/llama_phase"
         try:
-            os.mkfifo("/tmp/llama_phase")
+            os.mkfifo(pipe_path)
         except FileExistsError:
             pass
-        self.phase_pipe = open("/tmp/llama_phase", "w")
+
+        print(f"\nOpening phase communication pipe at {pipe_path}")
+        self.phase_pipe = open(pipe_path, "w")
+        self.mark_phase("initialization")
 
         try:
             # Setup profiler
@@ -138,11 +149,17 @@ class LlamaTrainer:
             if self.profiler:
                 self.profiler.start()
 
-            # Training process
-            with self.profile_section("full_training"):
-                data = self.prepare_data(data_path)
-                model, tokenizer = self.get_model_tokenizer()
+            print("\nStarting training process...")
 
+            # Data preparation
+            data = self.prepare_data(data_path)
+
+            # Model initialization
+            model, tokenizer = self.get_model_tokenizer()
+
+            # Training setup
+            with self.profile_section("training_setup"):
+                print("\nConfiguring training parameters...")
                 peft_config = LoraConfig(
                     r=8,
                     lora_alpha=16,
@@ -156,13 +173,21 @@ class LlamaTrainer:
                     train_dataset=data,
                     peft_config=peft_config,
                     dataset_text_field="text",
-                    args=self.get_training_args(),
+                    args=self.setup_training_args(),
                     tokenizer=tokenizer,
                     packing=False,
                     max_seq_length=1024
                 )
 
+            # Main training loop
+            with self.profile_section("training"):
+                print("\nStarting main training loop...")
                 trainer.train()
+
+            # Save final model
+            with self.profile_section("model_saving"):
+                print("\nSaving trained model...")
+                trainer.save_model()
 
             # Print profiling summary if available
             if self.profiler:
@@ -174,17 +199,21 @@ class LlamaTrainer:
             print(f"Training error: {e}")
             raise
         finally:
-            # Cleanup
+            print("\nCleaning up...")
+            self.mark_phase("cleanup")
+
+            # Cleanup profiler
             if hasattr(self, 'profiler') and self.profiler:
                 try:
                     self.profiler.stop()
                 except Exception:
                     pass
 
-            if hasattr(self, 'phase_pipe'):
+            # Cleanup phase pipe
+            if self.phase_pipe:
                 try:
                     self.phase_pipe.close()
-                    os.remove("/tmp/llama_phase")
+                    os.remove(pipe_path)
                 except Exception:
                     pass
 
