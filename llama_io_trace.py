@@ -208,6 +208,8 @@ class IOStats:
         self.io_events = []
         self.phase = "unknown"
         self.phase_start = time.time()
+        # Map to store file descriptors to names
+        self.fd_to_name = {}
 
     def add_io(self, event, filename):
         self.io_events.append({
@@ -221,12 +223,35 @@ class IOStats:
         })
 
     def set_phase(self, phase):
-        self.phase = phase
-        self.phase_start = time.time()
+        if phase != self.phase:
+            print(f"\nPhase change: {phase} (previous: {self.phase})")
+            self.phase = phase
+            self.phase_start = time.time()
+
+    def monitor_phase_pipe(self):
+        """Monitor named pipe for phase updates from PyTorch"""
+        pipe_path = "/tmp/llama_phase"
+
+        while True:
+            if not os.path.exists(pipe_path):
+                print(f"Waiting for phase pipe at {pipe_path}...")
+                time.sleep(1)
+                continue
+
+            try:
+                with open(pipe_path, "r") as pipe:
+                    while True:
+                        phase = pipe.readline().strip()
+                        if phase:
+                            self.set_phase(phase)
+            except Exception as e:
+                print(f"Phase pipe error: {e}")
+                time.sleep(1)
 
     def print_summary(self):
         print("\nI/O Summary by Phase:")
         phases = set(e['phase'] for e in self.io_events)
+
         for phase in phases:
             phase_events = [e for e in self.io_events if e['phase'] == phase]
             print(f"\nPhase: {phase}")
@@ -259,12 +284,9 @@ class IOStats:
                 for f, size in sorted(files.items(), key=lambda x: x[1], reverse=True)[:5]:
                     print(f"  {f}: {size/1024/1024:.2f}MB")
 
-stats = IOStats()
-fd_to_name = {}
-
 def print_event(cpu, data, size):
     event = b["io_events"].event(data)
-    filename = fd_to_name.get(event.fd, f"fd_{event.fd}")
+    filename = stats.fd_to_name.get(event.fd, f"fd_{event.fd}")
 
     if event.size > 0:
         print(f"[{stats.phase}] {event.comm} {filename} "
@@ -273,34 +295,21 @@ def print_event(cpu, data, size):
               f"Latency: {event.ts/1000000:.2f}ms")
         stats.add_io(event, filename)
 
-def monitor_pytorch():
-    """PyTorch profiler to identify phases"""
-    while True:
-        try:
-            with profiler.profile(
-                    activities=[
-                        profiler.ProfilerActivity.CPU,
-                        profiler.ProfilerActivity.CUDA,
-                    ],
-                    record_shapes=True,
-                    schedule=profiler.schedule(wait=1, warmup=1, active=1)
-            ) as p:
-                for event in p.events():
-                    if "load" in event.name.lower():
-                        stats.set_phase("dataload")
-                    elif "save" in event.name.lower() or "checkpoint" in event.name.lower():
-                        stats.set_phase("checkpoint")
-        except Exception as e:
-            print(f"PyTorch profiling error: {e}")
-        time.sleep(0.1)
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("pid", help="Process ID to trace")
     args = parser.parse_args()
 
-    bpf_text = bpf_text.replace('LLAMA_PID', args.pid)
+    # Initialize monitoring
+    stats = IOStats()
 
+    # Start phase monitoring thread
+    phase_thread = threading.Thread(target=stats.monitor_phase_pipe)
+    phase_thread.daemon = True
+    phase_thread.start()
+
+    # Initialize BPF
+    bpf_text = bpf_text.replace('LLAMA_PID', args.pid)
     b = BPF(text=bpf_text)
 
     # Attach probes
@@ -312,15 +321,11 @@ if __name__ == '__main__':
     b.attach_kretprobe(event="__x64_sys_open", fn_name="trace_open_return")
     b.attach_kprobe(event="__x64_sys_lseek", fn_name="trace_lseek_enter")
 
+    # Set up event monitoring
     b["io_events"].open_perf_buffer(print_event)
 
-    # Start PyTorch profiling in background
-    profiler_thread = threading.Thread(target=monitor_pytorch)
-    profiler_thread.daemon = True
-    profiler_thread.start()
-
     print(f"\nTracing LLaMa I/O (PID: {args.pid})... Ctrl+C to end.")
-    print("Monitoring both PyTorch operations and system I/O")
+    print("Waiting for phase updates from PyTorch training...")
 
     try:
         while True:
