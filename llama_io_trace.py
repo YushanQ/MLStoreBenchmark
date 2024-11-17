@@ -19,6 +19,7 @@ struct data_t {
     u32 fd;
     s64 size;
     u64 offset;
+    char fname[256];
     char comm[16];
     char syscall[8];
 };
@@ -30,6 +31,10 @@ static __always_inline void set_syscall(struct data_t *data, const char *name) {
     for (int i = 0; i < 8 && name[i]; i++) {
         data->syscall[i] = name[i];
     }
+}
+
+static __always_inline void get_filename(const char *user_filename, char *kernel_buffer) {
+    bpf_probe_read_user_str(kernel_buffer, 256, user_filename);
 }
 
 int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
@@ -123,6 +128,85 @@ int syscall__fsync_enter(struct pt_regs *ctx, int fd) {
     set_syscall(&data, "mmap");
     events.perf_submit(ctx, &data, sizeof(data));
     
+    return 0;
+}
+
+int syscall__open_enter(struct pt_regs *ctx, const char *filename, int flags) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = 0;     // Will be set in return probe
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "open");
+    get_filename(filename, data.fname);
+    
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+
+int syscall__openat_enter(struct pt_regs *ctx, int dirfd, const char *filename, int flags) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = 0;     // Will be set in return probe
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "openat");
+    get_filename(filename, data.fname);
+    
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+
+// Track the returned file descriptor from open/openat
+int syscall__open_return(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    int fd = PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        struct data_t data = {};
+        data.timestamp = bpf_ktime_get_ns();
+        data.pid = pid;
+        data.fd = fd;
+        data.size = 0;
+        
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        set_syscall(&data, "open_fd");
+        events.perf_submit(ctx, &data, sizeof(data));
+    }
+    return 0;
+}
+
+int syscall__openat_return(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    int fd = PT_REGS_RC(ctx);
+    if (fd >= 0) {
+        struct data_t data = {};
+        data.timestamp = bpf_ktime_get_ns();
+        data.pid = pid;
+        data.fd = fd;
+        data.size = 0;
+        
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        set_syscall(&data, "openat_fd");
+        events.perf_submit(ctx, &data, sizeof(data));
+    }
     return 0;
 }
 
@@ -263,33 +347,43 @@ class IOTracker:
 
     def print_event(self, cpu, data, size):
         event = b["events"].event(data)
-        syscall = event.syscall.decode('utf-8', 'ignore')
+        syscall = event.syscall.decode('utf-8', 'ignore').strip('\x00')
 
-        if event.size <= 0 and syscall != "lseek":
+        if event.size <= 0 and syscall not in ["lseek", "open", "openat", "open_fd", "openat_fd"]:
             return
 
-        # Refresh FD cache periodically
-        self.refresh_fd_cache(event.pid)
+        # Get real path (except for initial open calls which have the path in fname)
+        if syscall in ["open", "openat"]:
+            fname = event.fname.decode('utf-8', 'ignore').strip('\x00')
+        else:
+            # Refresh FD cache periodically
+            self.refresh_fd_cache(event.pid)
+            fname = self.get_fd_path(event.pid, event.fd)
 
-        # Get real path
-        fname = self.get_fd_path(event.pid, event.fd)
+        # Print formatted output based on syscall type
         timestamp = self.get_wall_time(event.timestamp)
-
-        # Update phase statistics
-        if syscall in ['read', 'write']:
-            self.update_stats(self.current_phase, syscall, event.size, event.timestamp)
 
         # Print formatted output with offset information
         if syscall == "lseek":
             print(f"[{self.current_phase:12}] "
-                  f"{syscall:6} {fname:50} "
-                  f"New Offset: {event.offset} "
-                  f"[{timestamp}] ")
+                  f"[{timestamp}] "
+                  f"{syscall:8} {fname:50} "
+                  f"New Offset: {event.offset}")
+        elif syscall in ["open", "openat"]:
+            print(f"[{self.current_phase:12}] "
+                  f"[{timestamp}] "
+                  f"{syscall:8} {fname:50} "
+                  f"Opening file")
+        elif syscall in ["open_fd", "openat_fd"]:
+            print(f"[{self.current_phase:12}] "
+                  f"[{timestamp}] "
+                  f"{syscall:8} {fname:50} "
+                  f"Got FD: {event.fd}")
         else:
             print(f"[{self.current_phase:12}] "
+                  f"[{timestamp}] "
                   f"{syscall:6} {fname:50} "
-                  f"Size: {self.format_size(event.size)} "
-                  f"[{timestamp}] ")
+                  f"Size: {self.format_size(event.size)} ")
 
     def print_summary(self):
         """Enhanced summary with access pattern statistics"""
@@ -322,6 +416,10 @@ def main():
     b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
     b.attach_kprobe(event="__x64_sys_mmap", fn_name="syscall__mmap_enter")
     b.attach_kprobe(event="__x64_sys_fsync", fn_name="syscall__fsync_enter")
+    b.attach_kprobe(event="__x64_sys_open", fn_name="syscall__open_enter")
+    b.attach_kretprobe(event="__x64_sys_open", fn_name="syscall__open_return")
+    b.attach_kprobe(event="__x64_sys_openat", fn_name="syscall__openat_enter")
+    b.attach_kretprobe(event="__x64_sys_openat", fn_name="syscall__openat_return")
 
     # Create and setup tracker
     tracker = IOTracker()
