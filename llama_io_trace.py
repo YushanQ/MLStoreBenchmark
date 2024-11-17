@@ -210,6 +210,24 @@ int syscall__openat_return(struct pt_regs *ctx) {
     return 0;
 }
 
+int syscall__pwrite64_enter(struct pt_regs *ctx, int fd, const void *buf, size_t count, loff_t pos) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = count;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "pwrite64");
+    events.perf_submit(ctx, &data, sizeof(data));
+    
+    return 0;
+}
+
 
 """
 
@@ -420,6 +438,7 @@ def main():
     b.attach_kretprobe(event="__x64_sys_open", fn_name="syscall__open_return")
     b.attach_kprobe(event="__x64_sys_openat", fn_name="syscall__openat_enter")
     b.attach_kretprobe(event="__x64_sys_openat", fn_name="syscall__openat_return")
+    b.attach_kprobe(event="__x64_sys_pwrite64", fn_name="syscall__pwrite64_enter")
 
     # Create and setup tracker
     tracker = IOTracker()
