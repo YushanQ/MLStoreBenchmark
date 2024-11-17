@@ -21,8 +21,15 @@ struct data_t {
     char syscall[8];
 };
 
+// Track offset for each file descriptor
+struct fd_info {
+    u64 offset;
+    u64 size;
+};
+
 BPF_HASH(start, u32, u64);
 BPF_HASH(fds, u32, u32);
+BPF_HASH(fd_offsets, u32, struct fd_info);
 BPF_PERF_OUTPUT(events);
 
 static __always_inline void set_syscall(struct data_t *data, const char *name) {
@@ -32,7 +39,7 @@ static __always_inline void set_syscall(struct data_t *data, const char *name) {
     }
 }
 
-int syscall__read_enter(struct pt_regs *ctx, int fd) {
+int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
         return 0;
@@ -40,6 +47,16 @@ int syscall__read_enter(struct pt_regs *ctx, int fd) {
     u64 ts = bpf_ktime_get_ns();
     start.update(&pid, &ts);
     fds.update(&pid, &fd);
+    
+    // Get existing fd_info or initialize new one
+    struct fd_info info = {};
+    struct fd_info *existing_info = fd_offsets.lookup(&fd);
+    if (existing_info) {
+        info = *existing_info;
+    }
+    info.size = count;  // Store requested size
+    fd_offsets.update(&fd, &info);
+    
     return 0;
 }
 
@@ -52,23 +69,36 @@ int syscall__read_return(struct pt_regs *ctx) {
     
     u64 *tsp = start.lookup(&pid);
     u32 *fdp = fds.lookup(&pid);
+    if (!tsp || !fdp)
+        return 0;
+        
+    int fd = *fdp;
+    struct fd_info *info = fd_offsets.lookup(&fd);
+    if (!info)
+        return 0;
     
-    if (tsp && fdp) {
-        data.ts = bpf_ktime_get_ns() - *tsp;
-        data.pid = pid;
-        data.fd = *fdp;
-        data.size = PT_REGS_RC(ctx);
-        set_syscall(&data, "read");
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        events.perf_submit(ctx, &data, sizeof(data));
+    data.ts = bpf_ktime_get_ns() - *tsp;
+    data.pid = pid;
+    data.fd = fd;
+    data.offset = info->offset;
+    data.size = PT_REGS_RC(ctx);  // Actual bytes read
+    
+    // Update offset for next operation
+    if (data.size > 0) {
+        info->offset += data.size;
+        fd_offsets.update(&fd, info);
     }
+    
+    set_syscall(&data, "read");
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    events.perf_submit(ctx, &data, sizeof(data));
     
     start.delete(&pid);
     fds.delete(&pid);
     return 0;
 }
 
-int syscall__write_enter(struct pt_regs *ctx, int fd) {
+int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
         return 0;
@@ -76,6 +106,15 @@ int syscall__write_enter(struct pt_regs *ctx, int fd) {
     u64 ts = bpf_ktime_get_ns();
     start.update(&pid, &ts);
     fds.update(&pid, &fd);
+    
+    struct fd_info info = {};
+    struct fd_info *existing_info = fd_offsets.lookup(&fd);
+    if (existing_info) {
+        info = *existing_info;
+    }
+    info.size = count;
+    fd_offsets.update(&fd, &info);
+    
     return 0;
 }
 
@@ -88,16 +127,81 @@ int syscall__write_return(struct pt_regs *ctx) {
     
     u64 *tsp = start.lookup(&pid);
     u32 *fdp = fds.lookup(&pid);
+    if (!tsp || !fdp)
+        return 0;
+        
+    int fd = *fdp;
+    struct fd_info *info = fd_offsets.lookup(&fd);
+    if (!info)
+        return 0;
     
-    if (tsp && fdp) {
-        data.ts = bpf_ktime_get_ns() - *tsp;
-        data.pid = pid;
-        data.fd = *fdp;
-        data.size = PT_REGS_RC(ctx);
-        set_syscall(&data, "write");
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        events.perf_submit(ctx, &data, sizeof(data));
+    data.ts = bpf_ktime_get_ns() - *tsp;
+    data.pid = pid;
+    data.fd = fd;
+    data.offset = info->offset;
+    data.size = PT_REGS_RC(ctx);
+    
+    if (data.size > 0) {
+        info->offset += data.size;
+        fd_offsets.update(&fd, info);
     }
+    
+    set_syscall(&data, "write");
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    events.perf_submit(ctx, &data, sizeof(data));
+    
+    start.delete(&pid);
+    fds.delete(&pid);
+    return 0;
+}
+
+int syscall__lseek_enter(struct pt_regs *ctx, int fd, long offset, unsigned int whence) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    u64 ts = bpf_ktime_get_ns();
+    start.update(&pid, &ts);
+    fds.update(&pid, &fd);
+    return 0;
+}
+
+int syscall__lseek_return(struct pt_regs *ctx) {
+    struct data_t data = {};
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    u64 *tsp = start.lookup(&pid);
+    u32 *fdp = fds.lookup(&pid);
+    if (!tsp || !fdp)
+        return 0;
+        
+    int fd = *fdp;
+    struct fd_info *info = fd_offsets.lookup(&fd);
+    if (!info) {
+        info = &(struct fd_info){};
+    }
+    
+    data.ts = bpf_ktime_get_ns() - *tsp;
+    data.pid = pid;
+    data.fd = fd;
+    
+    // Update the offset based on lseek return value
+    long new_offset = PT_REGS_RC(ctx);
+    if (new_offset >= 0) {
+        info->offset = new_offset;
+        fd_offsets.update(&fd, info);
+        data.offset = new_offset;
+    } else {
+        data.offset = info->offset;
+    }
+    
+    data.size = 0;  // No data transferred in seek
+    set_syscall(&data, "lseek");
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    events.perf_submit(ctx, &data, sizeof(data));
     
     start.delete(&pid);
     fds.delete(&pid);
@@ -112,21 +216,10 @@ class IOTracker:
         self.start_time = time.time()
         self.current_phase = "unknown"
         self.phase_stats = {}
+        self.sequential_count = 0
+        self.random_count = 0
+        self.last_offset = {}  # Track last offset per FD
 
-    # def get_fd_path(self, pid, fd):
-    #     """Get real path for file descriptor"""
-    #     if fd in self.fd_to_name:
-    #         return self.fd_to_name[fd]
-    #
-    #     try:
-    #         fd_path = f"/proc/{pid}/fd/{fd}"
-    #         if os.path.exists(fd_path):
-    #             real_path = os.path.realpath(fd_path)
-    #             self.fd_to_name[fd] = real_path
-    #             return real_path
-    #     except Exception:
-    #         pass
-    #     return f"fd_{fd}"
     def get_fd_path(self, pid, fd):
         """Get real file path from file descriptor"""
         if fd in self.fd_to_name:
@@ -153,19 +246,6 @@ class IOTracker:
                 return real_path
 
         except (OSError, IndexError) as e:
-            # If we can't resolve it, check if it exists in /proc/[pid]/fdinfo for more details
-            try:
-                fdinfo_path = f"/proc/{pid}/fdinfo/{fd}"
-                if os.path.exists(fdinfo_path):
-                    with open(fdinfo_path) as f:
-                        info = f.readlines()
-                        for line in info:
-                            if line.startswith("pos:") or line.startswith("flags:"):
-                            # Could add more details about the file descriptor
-                                continue
-            except:
-                pass
-
             return f"fd_{fd}"
 
     def refresh_fd_cache(self, pid):
@@ -198,6 +278,47 @@ class IOTracker:
         except Exception as e:
             pass
 
+    def monitor_phase(self):
+        """Monitor named pipe for phase updates"""
+        pipe_path = "/tmp/llama_phase"
+
+        while True:
+            if not os.path.exists(pipe_path):
+                print(f"Waiting for phase pipe at {pipe_path}...")
+                time.sleep(1)
+                continue
+
+            try:
+                with open(pipe_path, "r") as pipe:
+                    while True:
+                        phase = pipe.readline().strip()
+                        if phase:
+                            if phase != self.current_phase:
+                                print(f"\n--- Switching to phase: {phase} ---")
+                                self.current_phase = phase
+            except Exception as e:
+                print(f"Phase pipe error: {e}")
+                time.sleep(1)
+
+    def is_sequential_access(self, fd, offset, size):
+        """Determine if access is sequential based on last offset"""
+        if fd not in self.last_offset:
+            self.last_offset[fd] = offset
+            return True
+
+        expected_offset = self.last_offset[fd]
+        self.last_offset[fd] = offset + size
+
+        # Allow small gaps (e.g., alignment padding)
+        return abs(offset - expected_offset) <= 4096
+
+    def update_access_pattern(self, fd, offset, size):
+        """Update sequential vs random access statistics"""
+        if self.is_sequential_access(fd, offset, size):
+            self.sequential_count += 1
+        else:
+            self.random_count += 1
+
     def update_stats(self, phase, syscall, size, latency):
         """Update statistics for current phase"""
         if phase not in self.phase_stats:
@@ -223,7 +344,7 @@ class IOTracker:
     def print_event(self, cpu, data, size):
         event = b["events"].event(data)
 
-        if event.size <= 0:
+        if event.size <= 0 and event.syscall.decode('utf-8', 'ignore') != "lseek":
             return
 
         # Refresh FD cache periodically
@@ -233,40 +354,29 @@ class IOTracker:
         fname = self.get_fd_path(event.pid, event.fd)
         syscall = event.syscall.decode('utf-8', 'ignore')
 
-        # Update statistics
-        self.update_stats(self.current_phase, syscall, event.size, event.ts)
+        # Update access pattern statistics
+        if syscall in ['read', 'write']:
+            self.update_access_pattern(event.fd, event.offset, event.size)
 
-        # Print formatted output with better file path
-        print(f"[{self.current_phase:12}] "
-            f"{syscall:6} {fname:50} "
-            f"Size: {event.size/1024/1024:.2f}MB "
-            f"Offset: {event.offset} "
-            f"Latency: {event.ts/1000000:.2f}ms")
+        # Update phase statistics
+        if syscall in ['read', 'write']:
+            self.update_stats(self.current_phase, syscall, event.size, event.ts)
 
-    def monitor_phase(self):
-        """Monitor named pipe for phase updates"""
-        pipe_path = "/tmp/llama_phase"
-
-        while True:
-            if not os.path.exists(pipe_path):
-                print(f"Waiting for phase pipe at {pipe_path}...")
-                time.sleep(1)
-                continue
-
-            try:
-                with open(pipe_path, "r") as pipe:
-                    while True:
-                        phase = pipe.readline().strip()
-                        if phase:
-                            if phase != self.current_phase:
-                                print(f"\n--- Switching to phase: {phase} ---")
-                                self.current_phase = phase
-            except Exception as e:
-                print(f"Phase pipe error: {e}")
-                time.sleep(1)
+        # Print formatted output with offset information
+        if syscall == "lseek":
+            print(f"[{self.current_phase:12}] "
+                  f"{syscall:6} {fname:50} "
+                  f"New Offset: {event.offset} "
+                  f"Latency: {event.ts/1000000:.2f}ms")
+        else:
+            print(f"[{self.current_phase:12}] "
+                  f"{syscall:6} {fname:50} "
+                  f"Size: {event.size/1024/1024:.2f}MB "
+                  f"Offset: {event.offset} "
+                  f"Latency: {event.ts/1000000:.2f}ms")
 
     def print_summary(self):
-        """Print summary statistics by phase"""
+        """Enhanced summary with access pattern statistics"""
         print("\nI/O Summary by Phase:")
         for phase, stats in self.phase_stats.items():
             print(f"\nPhase: {phase}")
@@ -281,6 +391,14 @@ class IOTracker:
                 print(f"  Count: {stats['write_count']}")
                 print(f"  Total size: {stats['write_bytes']/1024/1024:.2f}MB")
                 print(f"  Avg latency: {stats['write_latency']/stats['write_count']/1000000:.2f}ms")
+
+        total_ops = self.sequential_count + self.random_count
+        if total_ops > 0:
+            seq_percent = (self.sequential_count / total_ops) * 100
+            rand_percent = (self.random_count / total_ops) * 100
+            print("\nAccess Pattern Analysis:")
+            print(f"Sequential accesses: {self.sequential_count} ({seq_percent:.1f}%)")
+            print(f"Random accesses: {self.random_count} ({rand_percent:.1f}%)")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -297,6 +415,8 @@ def main():
     b.attach_kretprobe(event="__x64_sys_read", fn_name="syscall__read_return")
     b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
     b.attach_kretprobe(event="__x64_sys_write", fn_name="syscall__write_return")
+    b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
+    b.attach_kretprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_return")
 
     # Create and setup tracker
     tracker = IOTracker()
