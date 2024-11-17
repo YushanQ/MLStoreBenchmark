@@ -110,15 +110,6 @@ class IOTracker:
         else:
             return f"{size_bytes/1024/1024:.2f}MB"
 
-    def format_timestamp(self, ns_timestamp):
-        """Format nanosecond timestamp to human readable time"""
-        if self.start_time is None:
-            self.start_time = ns_timestamp
-
-        # Convert to seconds since start
-        seconds_since_start = (ns_timestamp - self.start_time) / 1e9
-        return f"+{seconds_since_start:.3f}s"
-
     def get_fd_path(self, pid, fd):
         """Get real file path from file descriptor"""
         if fd in self.fd_to_name:
@@ -199,25 +190,6 @@ class IOTracker:
                 print(f"Phase pipe error: {e}")
                 time.sleep(1)
 
-    def is_sequential_access(self, fd, offset, size):
-        """Determine if access is sequential based on last offset"""
-        if fd not in self.last_offset:
-            self.last_offset[fd] = offset
-            return True
-
-        expected_offset = self.last_offset[fd]
-        self.last_offset[fd] = offset + size
-
-        # Allow small gaps (e.g., alignment padding)
-        return abs(offset - expected_offset) <= 4096
-
-    def update_access_pattern(self, fd, offset, size):
-        """Update sequential vs random access statistics"""
-        if self.is_sequential_access(fd, offset, size):
-            self.sequential_count += 1
-        else:
-            self.random_count += 1
-
     def update_stats(self, phase, syscall, size, latency):
         """Update statistics for current phase"""
         if size < 0:  # Skip error returns
@@ -241,8 +213,9 @@ class IOTracker:
 
     def print_event(self, cpu, data, size):
         event = b["events"].event(data)
+        syscall = event.syscall.decode('utf-8', 'ignore')
 
-        if event.size <= 0 and event.syscall.decode('utf-8', 'ignore') != "lseek":
+        if event.size <= 0 and syscall != "lseek":
             return
 
         # Refresh FD cache periodically
@@ -250,28 +223,22 @@ class IOTracker:
 
         # Get real path
         fname = self.get_fd_path(event.pid, event.fd)
-        syscall = event.syscall.decode('utf-8', 'ignore')
-
-        # Update access pattern statistics
-        # if syscall in ['read', 'write']:
-        #     self.update_access_pattern(event.fd, event.offset, event.size)
 
         # Update phase statistics
         if syscall in ['read', 'write']:
-            self.update_stats(self.current_phase, syscall, event.size, event.ts)
+            self.update_stats(self.current_phase, syscall, event.size, event.timestamp)
 
         # Print formatted output with offset information
         if syscall == "lseek":
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"New Offset: {event.offset} "
-                  f"TS: {event.ts/1000000:.2f}ms")
+                  f"TS: {event.timestamp/1000000:.2f}ms")
         else:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"Size: {self.format_size(event.size)} "
-                  # f"Offset: {event.offset} "
-                  f"TS: {event.ts/1000000:.2f}ms")
+                  f"TS: {event.timestamp/1000000:.2f}ms")
 
     def print_summary(self):
         """Enhanced summary with access pattern statistics"""
@@ -288,14 +255,6 @@ class IOTracker:
                 print(f"  Count: {stats['write_count']}")
                 print(f"  Total size: {self.format_size(stats['write_bytes'])}")
 
-        # total_ops = self.sequential_count + self.random_count
-        # if total_ops > 0:
-        #     seq_percent = (self.sequential_count / total_ops) * 100
-        #     rand_percent = (self.random_count / total_ops) * 100
-        #     print("\nAccess Pattern Analysis:")
-        #     print(f"Sequential accesses: {self.sequential_count} ({seq_percent:.1f}%)")
-        #     print(f"Random accesses: {self.random_count} ({rand_percent:.1f}%)")
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("pid", help="Process ID to trace")
@@ -308,11 +267,8 @@ def main():
 
     # Attach kprobes
     b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
-    # b.attach_kretprobe(event="__x64_sys_read", fn_name="syscall__read_return")
     b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
-    # b.attach_kretprobe(event="__x64_sys_write", fn_name="syscall__write_return")
     b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
-    # b.attach_kretprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_return")
 
     # Create and setup tracker
     tracker = IOTracker()
