@@ -89,6 +89,44 @@ int syscall__lseek_enter(struct pt_regs *ctx, int fd, off_t offset, int whence) 
     
     return 0;
 }
+
+int syscall__mmap_enter(struct pt_regs *ctx, void *addr, size_t length, int prot, int flags, int fd) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = length;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "mmap");
+    events.perf_submit(ctx, &data, sizeof(data));
+    
+    return 0;
+}
+
+int syscall__fsync_enter(struct pt_regs *ctx, int fd) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+        
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "mmap");
+    events.perf_submit(ctx, &data, sizeof(data));
+    
+    return 0;
+}
+
+
 """
 
 class IOTracker:
@@ -98,6 +136,7 @@ class IOTracker:
         self.start_time = None
         self.current_phase = "unknown"
         self.phase_stats = {}
+        self.time_offset = time.time() - time.monotonic()
 
     def format_size(self, size_bytes):
         """Format size in human readable format"""
@@ -109,6 +148,17 @@ class IOTracker:
             return f"{size_bytes/1024:.2f}KB"
         else:
             return f"{size_bytes/1024/1024:.2f}MB"
+
+    def get_wall_time(self, kernel_ns):
+        """Convert kernel timestamp to wall clock time"""
+        # Convert nanoseconds to seconds
+        kernel_seconds = kernel_ns / 1e9
+
+        # Calculate wall clock time
+        wall_time = kernel_seconds + self.time_offset
+
+        # Return formatted time string
+        return datetime.fromtimestamp(wall_time).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
     def get_fd_path(self, pid, fd):
         """Get real file path from file descriptor"""
@@ -223,6 +273,7 @@ class IOTracker:
 
         # Get real path
         fname = self.get_fd_path(event.pid, event.fd)
+        timestamp = self.get_wall_time(event.timestamp)
 
         # Update phase statistics
         if syscall in ['read', 'write']:
@@ -233,12 +284,12 @@ class IOTracker:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"New Offset: {event.offset} "
-                  f"TS: {event.timestamp/1000000:.2f}ms")
+                  f"[{timestamp}] ")
         else:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"Size: {self.format_size(event.size)} "
-                  f"TS: {event.timestamp/1000000:.2f}ms")
+                  f"[{timestamp}] ")
 
     def print_summary(self):
         """Enhanced summary with access pattern statistics"""
@@ -269,6 +320,8 @@ def main():
     b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
     b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
     b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
+    b.attach_kprobe(event="__x64_sys_mmap", fn_name="syscall__mmap_enter")
+    b.attach_kprobe(event="__x64_sys_fsync", fn_name="syscall__fsync_enter")
 
     # Create and setup tracker
     tracker = IOTracker()
