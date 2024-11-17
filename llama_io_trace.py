@@ -8,12 +8,13 @@ from datetime import datetime
 
 # BPF program
 bpf_text = """
+#include <linux/sched.h>
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
-#include <linux/sched.h>
 
+// Data structure sent to user-space
 struct data_t {
-    u64 ts;
+    u64 timestamp;
     u32 pid;
     u32 fd;
     s64 size;
@@ -22,14 +23,6 @@ struct data_t {
     char syscall[8];
 };
 
-// Track offset for each file descriptor
-struct fd_info {
-    u64 offset;
-    s64 size;
-};
-
-BPF_HASH(fds, u32, u32);
-BPF_HASH(fd_offsets, u32, struct fd_info);
 BPF_PERF_OUTPUT(events);
 
 static __always_inline void set_syscall(struct data_t *data, const char *name) {
@@ -49,38 +42,13 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data.pid = pid;
     data.fd = fd;
     data.size = count;
+    // The current offset before read
+    // todo
     
-    // Get existing fd_info or initialize new one
-    struct fd_info info = {};
-    struct fd_info *existing_info = fd_offsets.lookup(&fd);
-    if (existing_info) {
-        info = *existing_info;
-    }
-    data.offset = info.offset;
-    
-    set_syscall(&data, "read");
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "read");
     events.perf_submit(ctx, &data, sizeof(data));
     
-    return 0;
-}
-
-int syscall__read_return(struct pt_regs *ctx) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
-    
-    s64 ret = PT_REGS_RC(ctx);
-    if (ret > 0) {
-        u32 *fdp = fds.lookup(&pid);
-        if (fdp) {
-            struct fd_info *info = fd_offsets.lookup(fdp);
-            if (info) {
-                info->offset += ret;
-                fd_offsets.update(fdp, info);
-            }
-        }
-    }
     return 0;
 }
 
@@ -94,41 +62,16 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data.pid = pid;
     data.fd = fd;
     data.size = count;
+    // The current offset before write
     
-    struct fd_info info = {};
-    struct fd_info *existing_info = fd_offsets.lookup(&fd);
-    if (existing_info) {
-        info = *existing_info;
-    }
-    data.offset = info.offset;
-    
-    set_syscall(&data, "write");
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "write");
     events.perf_submit(ctx, &data, sizeof(data));
     
     return 0;
 }
 
-int syscall__write_return(struct pt_regs *ctx) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
-    
-    s64 ret = PT_REGS_RC(ctx);
-    if (ret > 0) {
-        u32 *fdp = fds.lookup(&pid);
-        if (fdp) {
-            struct fd_info *info = fd_offsets.lookup(fdp);
-            if (info) {
-                info->offset += ret;
-                fd_offsets.update(fdp, info);
-            }
-        }
-    }
-    return 0;
-}
-
-int syscall__lseek_enter(struct pt_regs *ctx, int fd, long offset, unsigned int whence) {
+int syscall__lseek_enter(struct pt_regs *ctx, int fd, off_t offset, int whence) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
         return 0;
@@ -140,8 +83,8 @@ int syscall__lseek_enter(struct pt_regs *ctx, int fd, long offset, unsigned int 
     data.size = 0;
     data.offset = offset;
     
-    set_syscall(&data, "lseek");
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "lseek");
     events.perf_submit(ctx, &data, sizeof(data));
     
     return 0;
@@ -155,9 +98,6 @@ class IOTracker:
         self.start_time = None
         self.current_phase = "unknown"
         self.phase_stats = {}
-        self.sequential_count = 0
-        self.random_count = 0
-        self.last_offset = {}  # Track last offset per FD
 
     def format_size(self, size_bytes):
         """Format size in human readable format"""
@@ -313,8 +253,8 @@ class IOTracker:
         syscall = event.syscall.decode('utf-8', 'ignore')
 
         # Update access pattern statistics
-        if syscall in ['read', 'write']:
-            self.update_access_pattern(event.fd, event.offset, event.size)
+        # if syscall in ['read', 'write']:
+        #     self.update_access_pattern(event.fd, event.offset, event.size)
 
         # Update phase statistics
         if syscall in ['read', 'write']:
@@ -330,7 +270,7 @@ class IOTracker:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"Size: {self.format_size(event.size)} "
-                  f"Offset: {event.offset} "
+                  # f"Offset: {event.offset} "
                   f"TS: {event.ts/1000000:.2f}ms")
 
     def print_summary(self):
@@ -348,13 +288,13 @@ class IOTracker:
                 print(f"  Count: {stats['write_count']}")
                 print(f"  Total size: {self.format_size(stats['write_bytes'])}")
 
-        total_ops = self.sequential_count + self.random_count
-        if total_ops > 0:
-            seq_percent = (self.sequential_count / total_ops) * 100
-            rand_percent = (self.random_count / total_ops) * 100
-            print("\nAccess Pattern Analysis:")
-            print(f"Sequential accesses: {self.sequential_count} ({seq_percent:.1f}%)")
-            print(f"Random accesses: {self.random_count} ({rand_percent:.1f}%)")
+        # total_ops = self.sequential_count + self.random_count
+        # if total_ops > 0:
+        #     seq_percent = (self.sequential_count / total_ops) * 100
+        #     rand_percent = (self.random_count / total_ops) * 100
+        #     print("\nAccess Pattern Analysis:")
+        #     print(f"Sequential accesses: {self.sequential_count} ({seq_percent:.1f}%)")
+        #     print(f"Random accesses: {self.random_count} ({rand_percent:.1f}%)")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -368,11 +308,11 @@ def main():
 
     # Attach kprobes
     b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
-    b.attach_kretprobe(event="__x64_sys_read", fn_name="syscall__read_return")
+    # b.attach_kretprobe(event="__x64_sys_read", fn_name="syscall__read_return")
     b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
-    b.attach_kretprobe(event="__x64_sys_write", fn_name="syscall__write_return")
+    # b.attach_kretprobe(event="__x64_sys_write", fn_name="syscall__write_return")
     b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
-    b.attach_kretprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_return")
+    # b.attach_kretprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_return")
 
     # Create and setup tracker
     tracker = IOTracker()
