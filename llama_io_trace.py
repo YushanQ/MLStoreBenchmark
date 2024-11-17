@@ -44,9 +44,11 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     if (pid != LLAMA_PID)
         return 0;
     
-    u64 ts = bpf_ktime_get_ns();
-    start.update(&pid, &ts);
-    fds.update(&pid, &fd);
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = count;
     
     // Get existing fd_info or initialize new one
     struct fd_info info = {};
@@ -54,49 +56,31 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     if (existing_info) {
         info = *existing_info;
     }
-    info.size = (s64)count;  // Store requested size
-    fd_offsets.update(&fd, &info);
-    
-    return 0;
-}
-
-int syscall__read_return(struct pt_regs *ctx) {
-    struct data_t data = {};
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    
-    if (pid != LLAMA_PID)
-        return 0;
-    
-    u64 *tsp = start.lookup(&pid);
-    u32 *fdp = fds.lookup(&pid);
-    if (!tsp || !fdp)
-        return 0;
-        
-    int fd = *fdp;
-    struct fd_info *info = fd_offsets.lookup(&fd);
-    if (!info)
-        return 0;
-    
-    data.ts = bpf_ktime_get_ns() - *tsp;
-    data.pid = pid;
-    data.fd = fd;
-    data.offset = info->offset;
-    
-    s64 ret = (s64)PT_REGS_RC(ctx);
-    if (ret >= 0) {
-        data.size = ret;
-        info->offset += ret;
-        fd_offsets.update(&fd, info);
-    } else {
-        data.size = ret;  // Preserve error code
-    }
+    data.offset = info.offset;
     
     set_syscall(&data, "read");
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     events.perf_submit(ctx, &data, sizeof(data));
     
-    start.delete(&pid);
-    fds.delete(&pid);
+    return 0;
+}
+
+int syscall__read_return(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    s64 ret = PT_REGS_RC(ctx);
+    if (ret > 0) {
+        u32 *fdp = fds.lookup(&pid);
+        if (fdp) {
+            struct fd_info *info = fd_offsets.lookup(fdp);
+            if (info) {
+                info->offset += ret;
+                fd_offsets.update(fdp, info);
+            }
+        }
+    }
     return 0;
 }
 
@@ -105,55 +89,42 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     if (pid != LLAMA_PID)
         return 0;
     
-    u64 ts = bpf_ktime_get_ns();
-    start.update(&pid, &ts);
-    fds.update(&pid, &fd);
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = count;
     
     struct fd_info info = {};
     struct fd_info *existing_info = fd_offsets.lookup(&fd);
     if (existing_info) {
         info = *existing_info;
     }
-    info.size = count;
-    fd_offsets.update(&fd, &info);
-    
-    return 0;
-}
-
-int syscall__write_return(struct pt_regs *ctx) {
-    struct data_t data = {};
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    
-    if (pid != LLAMA_PID)
-        return 0;
-    
-    u64 *tsp = start.lookup(&pid);
-    u32 *fdp = fds.lookup(&pid);
-    if (!tsp || !fdp)
-        return 0;
-        
-    int fd = *fdp;
-    struct fd_info *info = fd_offsets.lookup(&fd);
-    if (!info)
-        return 0;
-    
-    data.ts = bpf_ktime_get_ns() - *tsp;
-    data.pid = pid;
-    data.fd = fd;
-    data.offset = info->offset;
-    data.size = PT_REGS_RC(ctx);
-    
-    if (data.size > 0) {
-        info->offset += data.size;
-        fd_offsets.update(&fd, info);
-    }
+    data.offset = info.offset;
     
     set_syscall(&data, "write");
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     events.perf_submit(ctx, &data, sizeof(data));
     
-    start.delete(&pid);
-    fds.delete(&pid);
+    return 0;
+}
+
+int syscall__write_return(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != LLAMA_PID)
+        return 0;
+    
+    s64 ret = PT_REGS_RC(ctx);
+    if (ret > 0) {
+        u32 *fdp = fds.lookup(&pid);
+        if (fdp) {
+            struct fd_info *info = fd_offsets.lookup(fdp);
+            if (info) {
+                info->offset += ret;
+                fd_offsets.update(fdp, info);
+            }
+        }
+    }
     return 0;
 }
 
@@ -162,51 +133,17 @@ int syscall__lseek_enter(struct pt_regs *ctx, int fd, long offset, unsigned int 
     if (pid != LLAMA_PID)
         return 0;
     
-    u64 ts = bpf_ktime_get_ns();
-    start.update(&pid, &ts);
-    fds.update(&pid, &fd);
-    return 0;
-}
-
-int syscall__lseek_return(struct pt_regs *ctx) {
     struct data_t data = {};
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    
-    if (pid != LLAMA_PID)
-        return 0;
-    
-    u64 *tsp = start.lookup(&pid);
-    u32 *fdp = fds.lookup(&pid);
-    if (!tsp || !fdp)
-        return 0;
-        
-    int fd = *fdp;
-    struct fd_info *info = fd_offsets.lookup(&fd);
-    if (!info) {
-        info = &(struct fd_info){};
-    }
-    
-    data.ts = bpf_ktime_get_ns() - *tsp;
+    data.timestamp = bpf_ktime_get_ns();
     data.pid = pid;
     data.fd = fd;
+    data.size = 0;
+    data.offset = offset;
     
-    // Update the offset based on lseek return value
-    long new_offset = PT_REGS_RC(ctx);
-    if (new_offset >= 0) {
-        info->offset = new_offset;
-        fd_offsets.update(&fd, info);
-        data.offset = new_offset;
-    } else {
-        data.offset = info->offset;
-    }
-    
-    data.size = 0;  // No data transferred in seek
     set_syscall(&data, "lseek");
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     events.perf_submit(ctx, &data, sizeof(data));
     
-    start.delete(&pid);
-    fds.delete(&pid);
     return 0;
 }
 """
@@ -215,7 +152,7 @@ class IOTracker:
     def __init__(self):
         self.fd_to_name = {}
         self.fd_cache_time = {}
-        self.start_time = time.time()
+        self.start_time = None
         self.current_phase = "unknown"
         self.phase_stats = {}
         self.sequential_count = 0
@@ -232,6 +169,15 @@ class IOTracker:
             return f"{size_bytes/1024:.2f}KB"
         else:
             return f"{size_bytes/1024/1024:.2f}MB"
+
+    def format_timestamp(self, ns_timestamp):
+        """Format nanosecond timestamp to human readable time"""
+        if self.start_time is None:
+            self.start_time = ns_timestamp
+
+        # Convert to seconds since start
+        seconds_since_start = (ns_timestamp - self.start_time) / 1e9
+        return f"+{seconds_since_start:.3f}s"
 
     def get_fd_path(self, pid, fd):
         """Get real file path from file descriptor"""
@@ -342,20 +288,16 @@ class IOTracker:
                 'read_count': 0,
                 'write_count': 0,
                 'read_bytes': 0,
-                'write_bytes': 0,
-                'read_latency': 0,
-                'write_latency': 0
+                'write_bytes': 0
             }
 
         stats = self.phase_stats[phase]
         if syscall == 'read':
             stats['read_count'] += 1
             stats['read_bytes'] += size
-            stats['read_latency'] += latency
         elif syscall == 'write':
             stats['write_count'] += 1
             stats['write_bytes'] += size
-            stats['write_latency'] += latency
 
     def print_event(self, cpu, data, size):
         event = b["events"].event(data)
@@ -383,13 +325,13 @@ class IOTracker:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"New Offset: {event.offset} "
-                  f"Latency: {event.ts/1000000:.2f}ms")
+                  f"TS: {event.ts/1000000:.2f}ms")
         else:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
                   f"Size: {self.format_size(event.size)} "
                   f"Offset: {event.offset} "
-                  f"Latency: {event.ts/1000000:.2f}ms")
+                  f"TS: {event.ts/1000000:.2f}ms")
 
     def print_summary(self):
         """Enhanced summary with access pattern statistics"""
@@ -400,13 +342,11 @@ class IOTracker:
                 print("Read operations:")
                 print(f"  Count: {stats['read_count']}")
                 print(f"  Total size: {self.format_size(stats['read_bytes'])}")
-                print(f"  Avg latency: {stats['read_latency']/stats['read_count']/1000000:.2f}ms")
 
             if stats['write_count'] > 0:
                 print("Write operations:")
                 print(f"  Count: {stats['write_count']}")
                 print(f"  Total size: {self.format_size(stats['write_bytes'])}")
-                print(f"  Avg latency: {stats['write_latency']/stats['write_count']/1000000:.2f}ms")
 
         total_ops = self.sequential_count + self.random_count
         if total_ops > 0:
