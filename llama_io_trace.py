@@ -1,275 +1,250 @@
 #!/usr/bin/python3
 from bcc import BPF
-from time import sleep
-import argparse
-import os
-import threading
 import time
-from pathlib import Path
+import os
+import argparse
+import threading
 
 # BPF program
 bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
-#include <linux/fdtable.h>
+#include <linux/sched.h>
 
-// Structure to track file descriptors
-struct fd_info_t {
-    u32 pid;
-    int fd;
-    char name[256];
-};
-
-// Structure for detailed I/O data
-struct io_data_t {
+struct data_t {
     u64 ts;
     u32 pid;
     u32 fd;
     u64 size;
     u64 offset;
-    u64 flags;
     char comm[16];
-    char fname[256];    // Add filename field
-    char syscall[16];   // Add syscall name
+    char syscall[8];
 };
 
-// Maps to store data
 BPF_HASH(start, u32, u64);
-BPF_HASH(fd_info, u32, struct fd_info_t);
-BPF_HASH(file_offsets, u32, u64);
-BPF_PERF_OUTPUT(io_events);
+BPF_HASH(fds, u32, u32);
+BPF_PERF_OUTPUT(events);
 
-// Helper: get filename for fd
-static int get_filename(int fd, char *buf, size_t size) {
-    struct task_struct *task;
-    struct file *file;
-    struct dentry *dentry;
-    struct qstr d_name;
-    
-    task = (struct task_struct *)bpf_get_current_task();
-    file = task->files->fdt->fd[fd];
-    if (!file)
-        return -1;
-        
-    dentry = file->f_path.dentry;
-    if (!dentry)
-        return -1;
-        
-    d_name = dentry->d_name;
-    if (!d_name.name)
-        return -1;
-        
-    bpf_probe_read_kernel_str(buf, size, d_name.name);
-    return 0;
-}
-
-// Get full file path
-static int get_path(struct pt_regs *ctx, const char __user *filename, char *path) {
-    bpf_probe_read_user_str(path, 256, filename);
-    return 0;
-}
-
-// Modified open tracking
-int trace_open_enter(struct pt_regs *ctx, const char __user *filename, int flags) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
-        
-    struct fd_info_t fd_data = {};
-    fd_data.pid = pid;
-    
-    // Get full path
-    get_path(ctx, filename, fd_data.name);
-    
-    u64 id = bpf_get_current_pid_tgid();
-    fd_info.update(&id, &fd_data);
-    return 0;
-}
-
-int trace_open_return(struct pt_regs *ctx) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
-        
-    int fd = PT_REGS_RC(ctx);
-    if (fd >= 0) {
-        u64 id = bpf_get_current_pid_tgid();
-        struct fd_info_t *fd_data = fd_info.lookup(&id);
-        if (fd_data) {
-            fd_data->fd = fd;
-            
-            // Get filename from helper
-            char fname[256];
-            if (get_filename(fd, fname, sizeof(fname)) == 0) {
-                bpf_probe_read_kernel_str(fd_data->name, sizeof(fd_data->name), fname);
-            }
-            
-            fd_info.update(&id, fd_data);
-        }
+static __always_inline void set_syscall(struct data_t *data, const char *name) {
+    #pragma unroll
+    for (int i = 0; i < 8 && name[i]; i++) {
+        data->syscall[i] = name[i];
     }
-    return 0;
 }
 
-// Track read operations
-int trace_read_enter(struct pt_regs *ctx, int fd) {
+int syscall__read_enter(struct pt_regs *ctx, int fd) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
         return 0;
     
     u64 ts = bpf_ktime_get_ns();
-    u64 id = bpf_get_current_pid_tgid();
-    start.update(&id, &ts);
+    start.update(&pid, &ts);
+    fds.update(&pid, &fd);
     return 0;
 }
 
-int trace_read_return(struct pt_regs *ctx) {
+int syscall__read_return(struct pt_regs *ctx) {
+    struct data_t data = {};
     u32 pid = bpf_get_current_pid_tgid() >> 32;
+    
     if (pid != LLAMA_PID)
         return 0;
     
-    u64 id = bpf_get_current_pid_tgid();
-    u64 *tsp = start.lookup(&id);
-    if (!tsp)
-        return 0;
+    u64 *tsp = start.lookup(&pid);
+    u32 *fdp = fds.lookup(&pid);
     
-    struct io_data_t data = {};
-    data.ts = bpf_ktime_get_ns() - *tsp;
-    data.pid = pid;
-    data.size = PT_REGS_RC(ctx);
-    
-    // Get full file path
-    struct task_struct *task;
-    struct file *file;
-    struct dentry *dentry;
-    
-    task = (struct task_struct *)bpf_get_current_task();
-    if (task) {
-        struct files_struct *files = task->files;
-        if (files) {
-            struct fdtable *fdt = files->fdt;
-            if (fdt && data.fd < fdt->max_fds) {
-                file = fdt->fd[data.fd];
-                if (file) {
-                    dentry = file->f_path.dentry;
-                    if (dentry) {
-                        bpf_probe_read_kernel_str(data.fname, sizeof(data.fname), dentry->d_name.name);
-                    }
-                }
-            }
-        }
+    if (tsp && fdp) {
+        data.ts = bpf_ktime_get_ns() - *tsp;
+        data.pid = pid;
+        data.fd = *fdp;
+        data.size = PT_REGS_RC(ctx);
+        set_syscall(&data, "read");
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        events.perf_submit(ctx, &data, sizeof(data));
     }
     
-    // Set syscall name
-    bpf_probe_read_kernel_str(data.syscall, sizeof(data.syscall), "read");
-    
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    io_events.perf_submit(ctx, &data, sizeof(data));
-    
-    start.delete(&id);
+    start.delete(&pid);
+    fds.delete(&pid);
     return 0;
 }
 
-// Track write operations
-int trace_write_enter(struct pt_regs *ctx, int fd) {
+int syscall__write_enter(struct pt_regs *ctx, int fd) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
         return 0;
     
     u64 ts = bpf_ktime_get_ns();
-    u64 id = bpf_get_current_pid_tgid();
-    start.update(&id, &ts);
+    start.update(&pid, &ts);
+    fds.update(&pid, &fd);
     return 0;
 }
 
-int trace_write_return(struct pt_regs *ctx) {
+int syscall__write_return(struct pt_regs *ctx) {
+    struct data_t data = {};
     u32 pid = bpf_get_current_pid_tgid() >> 32;
+    
     if (pid != LLAMA_PID)
         return 0;
     
-    u64 id = bpf_get_current_pid_tgid();
-    u64 *tsp = start.lookup(&id);
-    if (!tsp)
-        return 0;
+    u64 *tsp = start.lookup(&pid);
+    u32 *fdp = fds.lookup(&pid);
     
-    struct io_data_t data = {};
-    data.ts = bpf_ktime_get_ns() - *tsp;
-    data.pid = pid;
-    data.size = PT_REGS_RC(ctx);
-    
-    struct fd_info_t *fd_data = fd_info.lookup(&id);
-    if (fd_data) {
-        data.fd = fd_data->fd;
-        u64 *offset = file_offsets.lookup(&id);
-        if (offset)
-            data.offset = *offset;
+    if (tsp && fdp) {
+        data.ts = bpf_ktime_get_ns() - *tsp;
+        data.pid = pid;
+        data.fd = *fdp;
+        data.size = PT_REGS_RC(ctx);
+        set_syscall(&data, "write");
+        bpf_get_current_comm(&data.comm, sizeof(data.comm));
+        events.perf_submit(ctx, &data, sizeof(data));
     }
     
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    io_events.perf_submit(ctx, &data, sizeof(data));
-    
-    if (data.size > 0) {
-        u64 new_offset = data.offset + data.size;
-        file_offsets.update(&id, &new_offset);
-    }
-    
-    start.delete(&id);
-    return 0;
-}
-
-// Track lseek
-int trace_lseek_enter(struct pt_regs *ctx, int fd, off_t offset, int whence) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
-    
-    u64 id = bpf_get_current_pid_tgid();
-    file_offsets.update(&id, &offset);
+    start.delete(&pid);
+    fds.delete(&pid);
     return 0;
 }
 """
 
-class IOStats:
+class IOTracker:
     def __init__(self):
-        self.io_events = []
-        self.phase = "unknown"
-        self.phase_start = time.time()
-        # Map to store file descriptors to names
         self.fd_to_name = {}
-        self.file_offsets = {}  # Track file offsets
+        self.fd_cache_time = {}
+        self.start_time = time.time()
+        self.current_phase = "unknown"
+        self.phase_stats = {}
 
-    def update_fd_info(self, fd, name):
-        """Update fd to filename mapping"""
-        if name:
-            self.fd_to_name[fd] = name.decode('utf-8', errors='ignore') if isinstance(name, bytes) else name
+    # def get_fd_path(self, pid, fd):
+    #     """Get real path for file descriptor"""
+    #     if fd in self.fd_to_name:
+    #         return self.fd_to_name[fd]
+    #
+    #     try:
+    #         fd_path = f"/proc/{pid}/fd/{fd}"
+    #         if os.path.exists(fd_path):
+    #             real_path = os.path.realpath(fd_path)
+    #             self.fd_to_name[fd] = real_path
+    #             return real_path
+    #     except Exception:
+    #         pass
+    #     return f"fd_{fd}"
+    def get_fd_path(self, pid, fd):
+        """Get real file path from file descriptor"""
+        if fd in self.fd_to_name:
+            return self.fd_to_name[fd]
 
-    def add_io(self, event, filepath):
-        self.io_events.append({
-            'phase': self.phase,
-            'timestamp': time.time(),
-            'filepath': filepath,
-            'size': event.size,
-            'offset': event.offset,
-            'latency': event.ts,
-            'syscall': event.syscall.decode('utf-8', errors='ignore'),
-            'operation': 'read' if event.syscall.startswith(b'read') else 'write'
-        })
-
-    def update_fd_path(self, fd, path):
-        """Update fd to full path mapping"""
         try:
-            real_path = os.path.realpath(path)
-            self.fd_to_path[fd] = real_path
-        except Exception:
-            self.fd_to_path[fd] = path
+            fd_path = f"/proc/{pid}/fd/{fd}"
+            if os.path.exists(fd_path):
+                real_path = os.readlink(fd_path)  # Follow the symlink
 
-    def set_phase(self, phase):
-        if phase != self.phase:
-            print(f"\nPhase change: {phase} (previous: {self.phase})")
-            self.phase = phase
-            self.phase_start = time.time()
+                # Handle socket files
+                if "socket:" in real_path:
+                    inode = real_path.split("[")[1].split("]")[0]
+                    return f"socket:[{inode}]"
 
-    def monitor_phase_pipe(self):
-        """Monitor named pipe for phase updates from PyTorch"""
+                # Handle pipe files
+                if "pipe:" in real_path:
+                    inode = real_path.split("[")[1].split("]")[0]
+                    return f"pipe:[{inode}]"
+
+                # Store and return the real path
+                self.fd_to_name[fd] = real_path
+                self.fd_cache_time[fd] = time.time()
+                return real_path
+
+        except (OSError, IndexError) as e:
+            # If we can't resolve it, check if it exists in /proc/[pid]/fdinfo for more details
+            try:
+                fdinfo_path = f"/proc/{pid}/fdinfo/{fd}"
+                if os.path.exists(fdinfo_path):
+                    with open(fdinfo_path) as f:
+                        info = f.readlines()
+                        for line in info:
+                            if line.startswith("pos:") or line.startswith("flags:"):
+                            # Could add more details about the file descriptor
+                                continue
+            except:
+                pass
+
+            return f"fd_{fd}"
+
+    def refresh_fd_cache(self, pid):
+        """Periodically refresh the FD cache"""
+        current_time = time.time()
+
+        # Clear old cache entries after 5 seconds
+        old_fds = []
+        for fd, cache_time in self.fd_cache_time.items():
+            if current_time - cache_time > 5:
+                old_fds.append(fd)
+        for fd in old_fds:
+            self.fd_to_name.pop(fd, None)  # Safe delete
+            self.fd_cache_time.pop(fd, None)  # Safe delete
+
+        # Rescan /proc/[pid]/fd directory
+        try:
+            fd_dir = f"/proc/{pid}/fd"
+            if os.path.exists(fd_dir):
+                for fd_name in os.listdir(fd_dir):
+                    try:
+                        fd = int(fd_name)
+                        if fd not in self.fd_to_name:
+                            path = self.get_fd_path(pid, fd)
+                            if path:  # Only cache if we got a valid path
+                                self.fd_to_name[fd] = path
+                                self.fd_cache_time[fd] = current_time
+                    except ValueError:
+                        continue  # Skip non-integer fd names
+        except Exception as e:
+            pass
+
+    def update_stats(self, phase, syscall, size, latency):
+        """Update statistics for current phase"""
+        if phase not in self.phase_stats:
+            self.phase_stats[phase] = {
+                'read_count': 0,
+                'write_count': 0,
+                'read_bytes': 0,
+                'write_bytes': 0,
+                'read_latency': 0,
+                'write_latency': 0
+            }
+
+        stats = self.phase_stats[phase]
+        if syscall == 'read':
+            stats['read_count'] += 1
+            stats['read_bytes'] += size
+            stats['read_latency'] += latency
+        elif syscall == 'write':
+            stats['write_count'] += 1
+            stats['write_bytes'] += size
+            stats['write_latency'] += latency
+
+    def print_event(self, cpu, data, size):
+        event = b["events"].event(data)
+
+        if event.size <= 0:
+            return
+
+        # Refresh FD cache periodically
+        self.refresh_fd_cache(event.pid)
+
+        # Get real path
+        fname = self.get_fd_path(event.pid, event.fd)
+        syscall = event.syscall.decode('utf-8', 'ignore')
+
+        # Update statistics
+        self.update_stats(self.current_phase, syscall, event.size, event.ts)
+
+        # Print formatted output with better file path
+        print(f"[{self.current_phase:12}] "
+            f"{syscall:6} {fname:50} "
+            f"Size: {event.size/1024/1024:.2f}MB "
+            f"Offset: {event.offset} "
+            f"Latency: {event.ts/1000000:.2f}ms")
+
+    def monitor_phase(self):
+        """Monitor named pipe for phase updates"""
         pipe_path = "/tmp/llama_phase"
 
         while True:
@@ -283,136 +258,64 @@ class IOStats:
                     while True:
                         phase = pipe.readline().strip()
                         if phase:
-                            self.set_phase(phase)
+                            if phase != self.current_phase:
+                                print(f"\n--- Switching to phase: {phase} ---")
+                                self.current_phase = phase
             except Exception as e:
                 print(f"Phase pipe error: {e}")
                 time.sleep(1)
 
     def print_summary(self):
+        """Print summary statistics by phase"""
         print("\nI/O Summary by Phase:")
-        phases = set(e['phase'] for e in self.io_events)
-
-        for phase in phases:
-            phase_events = [e for e in self.io_events if e['phase'] == phase]
+        for phase, stats in self.phase_stats.items():
             print(f"\nPhase: {phase}")
-            print(f"Total I/O operations: {len(phase_events)}")
+            if stats['read_count'] > 0:
+                print("Read operations:")
+                print(f"  Count: {stats['read_count']}")
+                print(f"  Total size: {stats['read_bytes']/1024/1024:.2f}MB")
+                print(f"  Avg latency: {stats['read_latency']/stats['read_count']/1000000:.2f}ms")
 
-            reads = [e for e in phase_events if e['operation'] == 'read']
-            writes = [e for e in phase_events if e['operation'] == 'write']
+            if stats['write_count'] > 0:
+                print("Write operations:")
+                print(f"  Count: {stats['write_count']}")
+                print(f"  Total size: {stats['write_bytes']/1024/1024:.2f}MB")
+                print(f"  Avg latency: {stats['write_latency']/stats['write_count']/1000000:.2f}ms")
 
-            if reads:
-                print("\nRead operations:")
-                print(f"  Count: {len(reads)}")
-                print(f"  Total size: {sum(e['size'] for e in reads)/1024/1024:.2f}MB")
-                print(f"  Avg latency: {sum(e['latency'] for e in reads)/len(reads)/1000000:.2f}ms")
-                print("\nMost accessed files (reads):")
-                files = {}
-                for e in reads:
-                    files[e['filename']] = files.get(e['filename'], 0) + e['size']
-                for f, size in sorted(files.items(), key=lambda x: x[1], reverse=True)[:5]:
-                    print(f"  {f}: {size/1024/1024:.2f}MB")
-
-            if writes:
-                print("\nWrite operations:")
-                print(f"  Count: {len(writes)}")
-                print(f"  Total size: {sum(e['size'] for e in writes)/1024/1024:.2f}MB")
-                print(f"  Avg latency: {sum(e['latency'] for e in writes)/len(writes)/1000000:.2f}ms")
-                print("\nMost accessed files (writes):")
-                files = {}
-                for e in writes:
-                    files[e['filename']] = files.get(e['filename'], 0) + e['size']
-                for f, size in sorted(files.items(), key=lambda x: x[1], reverse=True)[:5]:
-                    print(f"  {f}: {size/1024/1024:.2f}MB")
-
-def print_event(cpu, data, size):
-    event = b["io_events"].event(data)
-
-    # Try to get real path
-    filepath = event.fname.decode('utf-8', errors='ignore')
-    if not filepath:
-        filepath = stats.fd_to_path.get(event.fd, f"fd_{event.fd}")
-
-    # Try to make path absolute if it's not
-    if not os.path.isabs(filepath):
-        try:
-            proc_fd = f"/proc/{event.pid}/fd/{event.fd}"
-            if os.path.exists(proc_fd):
-                filepath = os.path.realpath(proc_fd)
-        except Exception:
-            pass
-
-    if event.size > 0 or event.syscall.startswith(b'open'):
-        syscall = event.syscall.decode('utf-8', errors='ignore')
-        print(f"[{stats.phase}] {event.comm.decode('utf-8', errors='ignore')} "
-              f"[{syscall}] {filepath} "
-              f"Size: {event.size/1024/1024:.2f}MB "
-              f"Offset: {event.offset} "
-              f"Latency: {event.ts/1000000:.2f}ms")
-
-        # Update fd mapping on open
-        if syscall.startswith('open'):
-            stats.update_fd_path(event.fd, filepath)
-
-        stats.add_io(event, filepath)
-
-
-def monitor_phase_pipe():
-    """Monitor named pipe for phase updates"""
-    pipe_path = "/tmp/llama_phase"
-
-    while True:
-        if os.path.exists(pipe_path):
-            try:
-                with open(pipe_path, "r") as pipe:
-                    while True:
-                        phase = pipe.readline().strip()
-                        if phase:
-                            stats.set_phase(phase)
-                            print(f"\nPhase changed to: {phase}")
-            except Exception as e:
-                print(f"Phase pipe error: {e}")
-                time.sleep(1)
-        else:
-            print(f"Waiting for phase pipe at {pipe_path}...")
-            time.sleep(1)
-
-
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("pid", help="Process ID to trace")
     args = parser.parse_args()
 
-    # Initialize monitoring
-    stats = IOStats()
+    print("Starting I/O monitoring...")
+
+    global b
+    b = BPF(text=bpf_text.replace('LLAMA_PID', args.pid))
+
+    # Attach kprobes
+    b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
+    b.attach_kretprobe(event="__x64_sys_read", fn_name="syscall__read_return")
+    b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
+    b.attach_kretprobe(event="__x64_sys_write", fn_name="syscall__write_return")
+
+    # Create and setup tracker
+    tracker = IOTracker()
+    b["events"].open_perf_buffer(tracker.print_event)
 
     # Start phase monitoring thread
-    phase_thread = threading.Thread(target=stats.monitor_phase_pipe)
+    phase_thread = threading.Thread(target=tracker.monitor_phase)
     phase_thread.daemon = True
     phase_thread.start()
 
-    # Initialize BPF
-    bpf_text = bpf_text.replace('LLAMA_PID', args.pid)
-    b = BPF(text=bpf_text)
-
-    # Attach probes
-    b.attach_kprobe(event="__x64_sys_openat", fn_name="trace_open_enter")
-    b.attach_kretprobe(event="__x64_sys_openat", fn_name="trace_open_return")
-    b.attach_kprobe(event="__x64_sys_read", fn_name="trace_read_enter")
-    b.attach_kretprobe(event="__x64_sys_read", fn_name="trace_read_return")
-    b.attach_kprobe(event="__x64_sys_write", fn_name="trace_write_enter")
-    b.attach_kretprobe(event="__x64_sys_write", fn_name="trace_write_return")
-    b.attach_kprobe(event="__x64_sys_open", fn_name="trace_open_enter")
-    b.attach_kretprobe(event="__x64_sys_open", fn_name="trace_open_return")
-    b.attach_kprobe(event="__x64_sys_lseek", fn_name="trace_lseek_enter")
-
-    # Set up event monitoring
-    b["io_events"].open_perf_buffer(print_event)
-
-    print(f"\nTracing LLaMa I/O (PID: {args.pid})... Ctrl+C to end.")
-    print("Waiting for phase updates from PyTorch training...")
+    print(f"\nTracing I/O for PID {args.pid}... Ctrl+C to stop")
+    print("PHASE        SYSCALL FILENAME                        SIZE                OFFSET             LATENCY")
 
     try:
         while True:
             b.perf_buffer_poll()
     except KeyboardInterrupt:
-        stats.print_summary()
+        print("\nGenerating summary...")
+        tracker.print_summary()
+
+if __name__ == "__main__":
+    main()
