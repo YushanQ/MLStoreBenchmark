@@ -4,6 +4,7 @@ import time
 import os
 import argparse
 import threading
+from datetime import datetime
 
 # BPF program
 bpf_text = """
@@ -15,7 +16,7 @@ struct data_t {
     u64 ts;
     u32 pid;
     u32 fd;
-    u64 size;
+    s64 size;
     u64 offset;
     char comm[16];
     char syscall[8];
@@ -24,10 +25,9 @@ struct data_t {
 // Track offset for each file descriptor
 struct fd_info {
     u64 offset;
-    u64 size;
+    s64 size;
 };
 
-BPF_HASH(start, u32, u64);
 BPF_HASH(fds, u32, u32);
 BPF_HASH(fd_offsets, u32, struct fd_info);
 BPF_PERF_OUTPUT(events);
@@ -54,7 +54,7 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     if (existing_info) {
         info = *existing_info;
     }
-    info.size = count;  // Store requested size
+    info.size = (s64)count;  // Store requested size
     fd_offsets.update(&fd, &info);
     
     return 0;
@@ -81,12 +81,14 @@ int syscall__read_return(struct pt_regs *ctx) {
     data.pid = pid;
     data.fd = fd;
     data.offset = info->offset;
-    data.size = PT_REGS_RC(ctx);  // Actual bytes read
     
-    // Update offset for next operation
-    if (data.size > 0) {
-        info->offset += data.size;
+    s64 ret = (s64)PT_REGS_RC(ctx);
+    if (ret >= 0) {
+        data.size = ret;
+        info->offset += ret;
         fd_offsets.update(&fd, info);
+    } else {
+        data.size = ret;  // Preserve error code
     }
     
     set_syscall(&data, "read");
@@ -220,6 +222,17 @@ class IOTracker:
         self.random_count = 0
         self.last_offset = {}  # Track last offset per FD
 
+    def format_size(self, size_bytes):
+        """Format size in human readable format"""
+        if size_bytes < 0:
+            return f"error({size_bytes})"
+        elif size_bytes < 1024:
+            return f"{size_bytes}B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes/1024:.2f}KB"
+        else:
+            return f"{size_bytes/1024/1024:.2f}MB"
+
     def get_fd_path(self, pid, fd):
         """Get real file path from file descriptor"""
         if fd in self.fd_to_name:
@@ -321,6 +334,9 @@ class IOTracker:
 
     def update_stats(self, phase, syscall, size, latency):
         """Update statistics for current phase"""
+        if size < 0:  # Skip error returns
+            return
+
         if phase not in self.phase_stats:
             self.phase_stats[phase] = {
                 'read_count': 0,
@@ -371,7 +387,7 @@ class IOTracker:
         else:
             print(f"[{self.current_phase:12}] "
                   f"{syscall:6} {fname:50} "
-                  f"Size: {event.size/1024/1024:.2f}MB "
+                  f"Size: {self.format_size(event.size)} "
                   f"Offset: {event.offset} "
                   f"Latency: {event.ts/1000000:.2f}ms")
 
@@ -383,13 +399,13 @@ class IOTracker:
             if stats['read_count'] > 0:
                 print("Read operations:")
                 print(f"  Count: {stats['read_count']}")
-                print(f"  Total size: {stats['read_bytes']/1024/1024:.2f}MB")
+                print(f"  Total size: {self.format_size(stats['read_bytes'])}")
                 print(f"  Avg latency: {stats['read_latency']/stats['read_count']/1000000:.2f}ms")
 
             if stats['write_count'] > 0:
                 print("Write operations:")
                 print(f"  Count: {stats['write_count']}")
-                print(f"  Total size: {stats['write_bytes']/1024/1024:.2f}MB")
+                print(f"  Total size: {self.format_size(stats['write_bytes'])}")
                 print(f"  Avg latency: {stats['write_latency']/stats['write_count']/1000000:.2f}ms")
 
         total_ops = self.sequential_count + self.random_count
