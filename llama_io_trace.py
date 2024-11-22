@@ -277,16 +277,16 @@ class IOTracker:
         self.phase_stats = {}
         self.time_offset = time.time() - time.monotonic()
 
-    def format_size(self, size_bytes):
-        """Format size in human readable format"""
-        if size_bytes < 0:
-            return f"error({size_bytes})"
-        elif size_bytes < 1024:
-            return f"{size_bytes}B"
-        elif size_bytes < 1024 * 1024:
-            return f"{size_bytes/1024:.2f}KB"
-        else:
-            return f"{size_bytes/1024/1024:.2f}MB"
+    # def format_size(self, size_bytes):
+    #     """Format size in human readable format"""
+    #     if size_bytes < 0:
+    #         return f"error({size_bytes})"
+    #     elif size_bytes < 1024:
+    #         return f"{size_bytes}B"
+    #     elif size_bytes < 1024 * 1024:
+    #         return f"{size_bytes/1024:.2f}KB"
+    #     else:
+    #         return f"{size_bytes/1024/1024:.2f}MB"
 
     def get_wall_time(self, kernel_ns):
         """Convert kernel timestamp to wall clock time"""
@@ -362,12 +362,11 @@ class IOTracker:
         pipe_path = "/tmp/llama_phase"
 
         while True:
-            if not os.path.exists(pipe_path):
-                print(f"Waiting for phase pipe at {pipe_path}...")
-                time.sleep(1)
-                continue
-
             try:
+                if not os.path.exists(pipe_path):
+                    time.sleep(1)
+                    continue
+
                 with open(pipe_path, "r") as pipe:
                     while True:
                         phase = pipe.readline().strip()
@@ -375,8 +374,15 @@ class IOTracker:
                             if phase != self.current_phase:
                                 print(f"\n--- Switching to phase: {phase} ---")
                                 self.current_phase = phase
+                        else:
+                            # If pipe is empty, sleep briefly to prevent busy waiting
+                            time.sleep(0.1)
+            except FileNotFoundError:
+                self.current_phase = "unknown"  # Set default phase if pipe doesn't exist
+                time.sleep(1)
             except Exception as e:
                 print(f"Phase pipe error: {e}")
+                self.current_phase = "error"    # Set error phase on exception
                 time.sleep(1)
 
     def update_stats(self, phase, syscall, size, latency):
@@ -439,7 +445,7 @@ class IOTracker:
                   f"[{timestamp}] "
                   f"{syscall:6} {fname:50} "
                   f"Offset: {event.offset} "
-                  f"Size: {self.format_size(event.size)} ")
+                  f"Size: {event.size} ")
 
     def print_summary(self):
         """Enhanced summary with access pattern statistics"""
