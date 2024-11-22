@@ -11,6 +11,7 @@ bpf_text = """
 #include <linux/sched.h>
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
+#include <linux/fdtable.h>
 
 // Data structure sent to user-space
 struct data_t {
@@ -37,6 +38,41 @@ static __always_inline void get_filename(const char *user_filename, char *kernel
     bpf_probe_read_user_str(kernel_buffer, 256, user_filename);
 }
 
+static __always_inline u64 get_file_offset(int fd) {
+    struct task_struct *task;
+    struct files_struct *files;
+    struct fdtable *fdt;
+    struct file **fdd;
+    struct file *file;
+    u64 pos = 0;
+
+    task = (struct task_struct *)bpf_get_current_task();
+    if (!task)
+        return 0;
+
+    files = task->files;
+    if (!files)
+        return 0;
+
+    fdt = files->fdt;
+    if (!fdt)
+        return 0;
+
+    if (fd >= fdt->max_fds)
+        return 0;
+
+    fdd = fdt->fd;
+    if (!fdd)
+        return 0;
+
+    bpf_probe_read(&file, sizeof(file), &fdd[fd]);
+    if (!file)
+        return 0;
+
+    bpf_probe_read(&pos, sizeof(pos), &file->f_pos);
+    return pos;
+}
+
 int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
@@ -48,7 +84,7 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data.fd = fd;
     data.size = count;
     // The current offset before read
-    // todo
+    data.offset = get_file_offset(fd);
     
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     set_syscall(&data, "read");
@@ -68,6 +104,7 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data.fd = fd;
     data.size = count;
     // The current offset before write
+    data.offset = get_file_offset(fd);
     
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     set_syscall(&data, "write");
@@ -401,6 +438,7 @@ class IOTracker:
             print(f"[{self.current_phase:12}] "
                   f"[{timestamp}] "
                   f"{syscall:6} {fname:50} "
+                  f"Offset: {event.offset} "
                   f"Size: {self.format_size(event.size)} ")
 
     def print_summary(self):
