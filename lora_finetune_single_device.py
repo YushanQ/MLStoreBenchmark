@@ -143,7 +143,6 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
 
-    
     def mark_phase(self, phase):
         """Explicitly mark phase for I/O monitoring"""
         self.current_phase = phase
@@ -154,29 +153,35 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 print(f"\nEntering phase: {phase}")
             except Exception as e:
                 print(f"Warning: Could not mark phase: {e}")
-                
-    
+
+    @contextmanager
+    def profile_section(self, name):
+        """Enhanced context manager for profiling sections with phase marking"""
+        previous_phase = self.current_phase
+        self.mark_phase(name)  # Mark start of section
+
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
         Extract the checkpoint state from file and validate. This includes the
         base model weights. If resume_from_checkpoint is True, this also includes
         the adapter weights and recipe state
         """
-        self._checkpointer = config.instantiate(
-            cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
-        )
-        checkpoint_dict = self._checkpointer.load_checkpoint()
+        with self.profile_section("load checkpoint"):
+            self._checkpointer = config.instantiate(
+                cfg_checkpointer,
+                resume_from_checkpoint=self._resume_from_checkpoint,
+            )
+            checkpoint_dict = self._checkpointer.load_checkpoint()
 
-        if self._resume_from_checkpoint:
-            if utils.ADAPTER_KEY not in checkpoint_dict:
-                raise ValueError(
-                    "Adapter weights not found. Please ensure a valid adapter checkpoint is provided."
-                )
-            # _update_recipe_state will throw an exception if the recipe state is not corrctly loaded
-            # no need to check here
-            self._update_recipe_state(checkpoint_dict)
-        return checkpoint_dict
+            if self._resume_from_checkpoint:
+                if utils.ADAPTER_KEY not in checkpoint_dict:
+                    raise ValueError(
+                        "Adapter weights not found. Please ensure a valid adapter checkpoint is provided."
+                    )
+                # _update_recipe_state will throw an exception if the recipe state is not corrctly loaded
+                # no need to check here
+                self._update_recipe_state(checkpoint_dict)
+            return checkpoint_dict
 
     def _update_recipe_state(self, ckpt_dict: Dict[str, Any]) -> None:
         """
