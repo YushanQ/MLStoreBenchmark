@@ -14,8 +14,9 @@ bpf_text = """
 #include <linux/fdtable.h>
 
 BPF_PERF_OUTPUT(events);
-#define DEFAULT_SUB_BUF_SIZE 255 
 #define DEFAULT_SUB_BUF_LEN 16
+#define DEFAULT_SUB_BUF_SIZE 255
+
 
 // Data structure sent to user-space
 struct data_t {
@@ -81,43 +82,63 @@ static __always_inline void get_file_path(int fd, char *fname) {
     struct file *file;
     
     task = (struct task_struct *)bpf_get_current_task();
-    if (!task)
+    if (!task) {
+        bpf_trace_printk("task is null\n", sizeof("task is null\n"));
         return;
-
-    files = task->files;
-    if (!files)
-        return;
-
-    fdt = files->fdt;
-    if (!fdt)
-        return;
-
-    if (fd >= fdt->max_fds)
-        return;
-
-    fdd = fdt->fd;
-    if (!fdd)
-        return;
-
-    bpf_probe_read(&file, sizeof(file), &fdd[fd]);
-    if (!file)
-        return;
-        
-    struct dentry dtry;
-    int nread = 0;
-    int i = 0;
-    bpf_probe_read(&dtry, sizeof(struct dentry), &file->f_path.dentry);
-    bpf_probe_read_str(fname, DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
+    }
     
-    nread++;
-    for (i = 1; i < DEFAULT_SUB_BUF_LEN; i++) {
-        if (dtry.d_parent != &dtry) {
-            bpf_probe_read(&dtry, sizeof(struct dentry), dtry.d_parent);
-            bpf_debug("read_enter: fpath=%d \\n", dtry.d_name.name); 
-            // bpf_probe_read_str(path_buf->buffer[i], DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
-            nread++;
-        } else
-            break;
+    files = task->files;
+    if (!files) {
+        bpf_trace_printk("files is null\n", sizeof("files is null\n"));
+        return;
+    }
+    
+    fdt = files->fdt;
+    if (!fdt) {
+        bpf_trace_printk("fdt is null\n", sizeof("fdt is null\n"));
+        return;
+    }
+    
+    if (fd >= fdt->max_fds) {
+        bpf_trace_printk("fd too large\n", sizeof("fd too large\n"));
+        return;
+    }
+    
+    fdd = fdt->fd;
+    if (!fdd) {
+        bpf_trace_printk("fdd is null\n", sizeof("fdd is null\n"));
+        return;
+    }
+    
+    bpf_probe_read(&file, sizeof(file), &fdd[fd]);
+    if (!file) {
+        bpf_trace_printk("file is null\n", sizeof("file is null\n"));
+        return;
+    }
+
+    struct dentry *dentry;
+    bpf_probe_read(&dentry, sizeof(dentry), &file->f_path.dentry);
+    if (!dentry) {
+        bpf_trace_printk("dentry is null\n", sizeof("dentry is null\n"));
+        return;
+    }
+
+    // Try to read the name directly from dentry
+    const unsigned char *name;
+    bpf_probe_read(&name, sizeof(name), &dentry->d_name.name);
+    if (!name) {
+        bpf_trace_printk("name pointer is null\n", sizeof("name pointer is null\n"));
+        return;
+    }
+
+    // Read the name string
+    int ret = bpf_probe_read_str(fname, DEFAULT_SUB_BUF_SIZE, name);
+    bpf_trace_printk("read %d bytes for name\n", sizeof("read %d bytes for name\n"), ret);
+    
+    if (ret > 0) {
+        bpf_trace_printk("filename: %s\n", sizeof("filename: %s\n"), fname);
+    } else {
+        bpf_trace_printk("failed to read filename\n", sizeof("failed to read filename\n"));
     }
 }
 
