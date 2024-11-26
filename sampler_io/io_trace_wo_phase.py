@@ -26,6 +26,8 @@ struct data_t {
 };
 
 BPF_PERF_OUTPUT(events);
+#define DEFAULT_SUB_BUF_SIZE 255 
+#define DEFAULT_SUB_BUF_LEN 16
 
 static __always_inline void set_syscall(struct data_t *data, const char *name) {
     #pragma unroll
@@ -69,6 +71,66 @@ static __always_inline u64 get_file_offset(int fd) {
     return pos;
 }
 
+static __always_inline void get_file_path(int fd, char buf[DEFAULT_SUB_BUF_LEN][DEFAULT_SUB_BUF_SIZE]) {
+    struct task_struct *task;
+    struct files_struct *files;
+    struct fdtable *fdt;
+    struct file **fdd;
+    struct file *file;
+    
+    task = (struct task_struct *)bpf_get_current_task();
+    if (!task)
+        return;
+
+    files = task->files;
+    if (!files)
+        return;
+
+    fdt = files->fdt;
+    if (!fdt)
+        return;
+
+    if (fd >= fdt->max_fds)
+        return;
+
+    fdd = fdt->fd;
+    if (!fdd)
+        return;
+
+    bpf_probe_read(&file, sizeof(file), &fdd[fd]);
+    if (!file)
+        return;
+        
+    struct dentry dtry;
+    int nread = 0;
+    int i = 0;
+    bpf_probe_read(&dtry, sizeof(struct dentry), &file->f_path.dentry);
+    bpf_probe_read_str(buf[i], DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
+    nread++;
+    for (i = 1; i < DEFAULT_SUB_BUF_LEN; i++) {
+        if (dtry.d_parent != &dtry) {
+            bpf_probe_read(&dtry, sizeof(struct dentry), dtry.d_parent);
+            bpf_probe_read_str(buf[i], DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
+            nread++;
+        } else
+            break;
+    }
+}
+
+static __always_inline void parse_file_path(char buf[DEFAULT_SUB_BUF_LEN][DEFAULT_SUB_BUF_SIZE], char *fpath) {
+    // Initialize fpath to an empty string
+    fpath[0] = '\\0';
+
+    // Traverse buf in reverse order
+    for (int i = DEFAULT_SUB_BUF_LEN - 1; i >= 0; i--) {
+        strcat(fpath, buf[i]);
+        if (i > 0) {
+            strcat(fpath, "/");
+        }
+    }
+}
+
+
 int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != LLAMA_PID)
@@ -81,6 +143,12 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data.size = count;
     // The current offset before read
     data.offset = get_file_offset(fd);
+    
+    // generate filepath
+    char buffer[DEFAULT_SUB_BUF_LEN][DEFAULT_SUB_BUF_SIZE];
+    get_file_path(fd, buffer);
+    parse_file_path(buffer, data.fname);
+    
     
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     set_syscall(&data, "read");
@@ -101,6 +169,9 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data.size = count;
     // The current offset before write
     data.offset = get_file_offset(fd);
+    
+    // generate filepath
+    
     
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
     set_syscall(&data, "write");
