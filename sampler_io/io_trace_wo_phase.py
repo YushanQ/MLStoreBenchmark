@@ -13,6 +13,10 @@ bpf_text = """
 #include <linux/fs.h>
 #include <linux/fdtable.h>
 
+BPF_PERF_OUTPUT(events);
+#define DEFAULT_SUB_BUF_SIZE 255 
+#define DEFAULT_SUB_BUF_LEN 16
+
 // Data structure sent to user-space
 struct data_t {
     u64 timestamp;
@@ -25,9 +29,7 @@ struct data_t {
     char syscall[8];
 };
 
-BPF_PERF_OUTPUT(events);
-#define DEFAULT_SUB_BUF_SIZE 255 
-#define DEFAULT_SUB_BUF_LEN 16
+BPF_PERCPU_ARRAY(data_map, struct data_t, 1);
 
 static __always_inline void set_syscall(struct data_t *data, const char *name) {
     #pragma unroll
@@ -71,7 +73,7 @@ static __always_inline u64 get_file_offset(int fd) {
     return pos;
 }
 
-static __always_inline void get_file_path(int fd, char buf[DEFAULT_SUB_BUF_LEN][DEFAULT_SUB_BUF_SIZE]) {
+static __always_inline void get_file_path(int fd, char *fname) {
     struct task_struct *task;
     struct files_struct *files;
     struct fdtable *fdt;
@@ -105,28 +107,17 @@ static __always_inline void get_file_path(int fd, char buf[DEFAULT_SUB_BUF_LEN][
     int nread = 0;
     int i = 0;
     bpf_probe_read(&dtry, sizeof(struct dentry), &file->f_path.dentry);
-    bpf_probe_read_str(buf[i], DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
+    bpf_probe_read_str(fname, DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
+    
     nread++;
     for (i = 1; i < DEFAULT_SUB_BUF_LEN; i++) {
         if (dtry.d_parent != &dtry) {
             bpf_probe_read(&dtry, sizeof(struct dentry), dtry.d_parent);
-            bpf_probe_read_str(buf[i], DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
+            bpf_debug("read_enter: fpath=%d \\n", dtry.d_name.name); 
+            // bpf_probe_read_str(path_buf->buffer[i], DEFAULT_SUB_BUF_SIZE, dtry.d_name.name);
             nread++;
         } else
             break;
-    }
-}
-
-static __always_inline void parse_file_path(char buf[DEFAULT_SUB_BUF_LEN][DEFAULT_SUB_BUF_SIZE], char *fpath) {
-    // Initialize fpath to an empty string
-    fpath[0] = '\\0';
-
-    // Traverse buf in reverse order
-    for (int i = DEFAULT_SUB_BUF_LEN - 1; i >= 0; i--) {
-        strcat(fpath, buf[i]);
-        if (i > 0) {
-            strcat(fpath, "/");
-        }
     }
 }
 
@@ -136,23 +127,24 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     if (pid != LLAMA_PID)
         return 0;
     
-    struct data_t data = {};
-    data.timestamp = bpf_ktime_get_ns();
-    data.pid = pid;
-    data.fd = fd;
-    data.size = count;
-    // The current offset before read
-    data.offset = get_file_offset(fd);
+    int mark = 0;
+    struct data_t *data = data_map.lookup(&mark);
+    if (!data)
+        return 0;
+    
+    data->timestamp = bpf_ktime_get_ns();
+    data->pid = pid;
+    data->fd = fd;
+    data->size = count;
+    data->offset = get_file_offset(fd);
     
     // generate filepath
-    char buffer[DEFAULT_SUB_BUF_LEN][DEFAULT_SUB_BUF_SIZE];
-    get_file_path(fd, buffer);
-    parse_file_path(buffer, data.fname);
+    get_file_path(fd, data->fname);
     
     
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    set_syscall(&data, "read");
-    events.perf_submit(ctx, &data, sizeof(data));
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    set_syscall(data, "read");
+    events.perf_submit(ctx, data, sizeof(*data));
     
     return 0;
 }
@@ -162,20 +154,23 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     if (pid != LLAMA_PID)
         return 0;
     
-    struct data_t data = {};
-    data.timestamp = bpf_ktime_get_ns();
-    data.pid = pid;
-    data.fd = fd;
-    data.size = count;
-    // The current offset before write
-    data.offset = get_file_offset(fd);
+    int mark = 0;
+    struct data_t *data = data_map.lookup(&mark);
+    if (!data)
+        return 0;
+    
+    data->timestamp = bpf_ktime_get_ns();
+    data->pid = pid;
+    data->fd = fd;
+    data->size = count;
+    data->offset = get_file_offset(fd);
     
     // generate filepath
     
     
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    set_syscall(&data, "write");
-    events.perf_submit(ctx, &data, sizeof(data));
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    set_syscall(data, "read");
+    events.perf_submit(ctx, data, sizeof(*data));
     
     return 0;
 }
