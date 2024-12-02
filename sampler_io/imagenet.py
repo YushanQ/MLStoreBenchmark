@@ -55,3 +55,5 @@ dataloader = torch.utils.data.DataLoader(dataset, batch_size=4) # use whatever b
 
 for i, (inputs, labels) in enumerate(dataloader):
     print(f"iteration {i} ")
+    if i > 20:
+        break

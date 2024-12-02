@@ -23,35 +23,35 @@ class LlamaTrainer:
     ):
         self.model_id = model_id
         self.output_model = output_model
-        self.profiler = None
-        self.phase_pipe = None
-        self.current_phase = "unknown"
+        # self.profiler = None
+        # self.phase_pipe = None
+        # self.current_phase = "unknown"
 
-    def mark_phase(self, phase):
-        """Explicitly mark phase for I/O monitoring"""
-        self.current_phase = phase
-        if self.phase_pipe:
-            try:
-                self.phase_pipe.write(f"{phase}\n")
-                self.phase_pipe.flush()
-                print(f"\nEntering phase: {phase}")
-            except Exception as e:
-                print(f"Warning: Could not mark phase: {e}")
+    # def mark_phase(self, phase):
+    #     """Explicitly mark phase for I/O monitoring"""
+    #     self.current_phase = phase
+    #     if self.phase_pipe:
+    #         try:
+    #             self.phase_pipe.write(f"{phase}\n")
+    #             self.phase_pipe.flush()
+    #             print(f"\nEntering phase: {phase}")
+    #         except Exception as e:
+    #             print(f"Warning: Could not mark phase: {e}")
 
-    @contextmanager
-    def profile_section(self, name):
-        """Enhanced context manager for profiling sections with phase marking"""
-        previous_phase = self.current_phase
-        self.mark_phase(name)  # Mark start of section
-
-        try:
-            with record_function(name):
-                yield
-        except Exception as e:
-            print(f"Profiling error in {name}: {e}")
-            raise
-        finally:
-            self.mark_phase(previous_phase)  # Restore previous phase
+    # @contextmanager
+    # def profile_section(self, name):
+    #     """Enhanced context manager for profiling sections with phase marking"""
+    #     previous_phase = self.current_phase
+    #     # self.mark_phase(name)  # Mark start of section
+    #
+    #     try:
+    #         with record_function(name):
+    #             yield
+    #     except Exception as e:
+    #         print(f"Profiling error in {name}: {e}")
+    #         raise
+    #     finally:
+    #         self.mark_phase(previous_phase)  # Restore previous phase
 
     def prepare_data(self, data_path):
         with self.profile_section("data_preparation"):

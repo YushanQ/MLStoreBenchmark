@@ -5,6 +5,7 @@ import os
 import argparse
 import threading
 from datetime import datetime
+import watchingthread
 
 # BPF program
 bpf_text = """
@@ -118,8 +119,15 @@ static __always_inline struct path_t get_file_path(int fd) {
 
 int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
+    u32 target_pid = LLAMA_PID;
+    
+    if (pid != target_pid) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        u32 ppid = task->real_parent->tgid;
+        if (ppid != target_pid) {
+            return 0;
+        }
+    }
     
     int mark = 0;
     struct data_t *data = data_map.lookup(&mark);
@@ -144,8 +152,15 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
 
 int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != LLAMA_PID)
-        return 0;
+    u32 target_pid = LLAMA_PID;
+    
+    if (pid != target_pid) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        u32 ppid = task->real_parent->tgid;
+        if (ppid != target_pid) {
+            return 0;
+        }
+    }
     
     int mark = 0;
     struct data_t *data = data_map.lookup(&mark);
@@ -163,6 +178,34 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
     set_syscall(data, "read");
+    events.perf_submit(ctx, data, sizeof(*data));
+    
+    return 0;
+}
+
+int syscall__open_enter(struct pt_regs *ctx, char *filename, int flags) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u32 target_pid = LLAMA_PID;
+    
+    if (pid != target_pid) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+        u32 ppid = task->real_parent->tgid;
+        if (ppid != target_pid) {
+            return 0;
+        }
+    }
+    
+    int mark = 0;
+    struct data_t *data = data_map.lookup(&mark);
+    if (!data)
+        return 0;
+    
+    data->timestamp = bpf_ktime_get_ns();
+    data->pid = pid;
+    bpf_probe_read_str(data->fname, sizeof(data->fname), filename);
+    
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+    set_syscall(data, "openat");
     events.perf_submit(ctx, data, sizeof(*data));
     
     return 0;
@@ -189,10 +232,12 @@ class IOTracker:
         # Print formatted output with offset information
         if syscall in ["read", "write"]:
             print(f"[{event.timestamp}] "
-                  f"{syscall:6} {fname:50} "
+                  f"{syscall:6} /proc/{event.pid}/fd/{event.fd} "
                   f"Offset: {event.offset} "
                   f"Size: {event.size} ")
-
+        elif syscall == "openat":
+            print(f"[{event.timestamp}] "
+                  f"{syscall:6} {event.fname} ")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -207,6 +252,7 @@ def main():
     # Attach kprobes
     b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
     b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
+    b.attach_kprobe(event="__x64_sys_openat", fn_name="syscall__open_enter")
 
     # Create and setup tracker
     tracker = IOTracker()

@@ -1,5 +1,6 @@
-data.txt
-log*.txt
+sampler_io/*.txt
+*.txt
 llama3.1-8B-Fine-tuned
 ImageNet*
-simple*.txt
+*.txt
+__pycache__/

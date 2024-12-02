@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Optional
@@ -123,15 +124,15 @@ class SimpleTokenizer:
 
 
 dataloader = get_book_dataloader(
-    file_path="simple_book_raw.txt",
-    batch_size=32,
+    file_path="/home/yushan/llama/sampler_io/simple_book_raw_xlg.txt",
+    batch_size=1024,
     sequence_length=50,
     stride=25
 )
 
 # Create and fit tokenizer
 tokenizer = SimpleTokenizer()
-with open("simple_book_raw_lg.txt", 'r') as f:
+with open("/home/yushan/llama/sampler_io/simple_book_raw_xlg.txt", 'r') as f:
     tokenizer.fit(f.read())
 
 # Iterate through batches
@@ -145,3 +146,6 @@ for i, batch in enumerate(dataloader):
     target_tokens = [tokenizer.encode(seq) for seq in targets]
 
     print(f"iteration {i}")
+
+    if i > 20:
+        break
