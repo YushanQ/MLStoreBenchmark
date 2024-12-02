@@ -2,3 +2,4 @@ data.txt
 log*.txt
 llama3.1-8B-Fine-tuned
 ImageNet*
+simple*.txt

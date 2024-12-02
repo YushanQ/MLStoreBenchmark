@@ -30,6 +30,10 @@ struct data_t {
     char syscall[8];
 };
 
+struct path_t {
+    char data[256];
+};
+
 BPF_PERCPU_ARRAY(data_map, struct data_t, 1);
 
 static __always_inline void set_syscall(struct data_t *data, const char *name) {
@@ -39,109 +43,78 @@ static __always_inline void set_syscall(struct data_t *data, const char *name) {
     }
 }
 
-static __always_inline u64 get_file_offset(int fd) {
+static __always_inline struct file *get_file_struct(int fd) {
     struct task_struct *task;
     struct files_struct *files;
     struct fdtable *fdt;
     struct file **fdd;
-    struct file *file;
-    u64 pos = 0;
-
+    
     task = (struct task_struct *)bpf_get_current_task();
     if (!task)
-        return 0;
-
+        return NULL;
+        
     files = task->files;
     if (!files)
-        return 0;
-
+        return NULL;
+        
     fdt = files->fdt;
     if (!fdt)
-        return 0;
-
+        return NULL;
+    
     if (fd >= fdt->max_fds)
-        return 0;
+        return NULL;
 
-    fdd = fdt->fd;
+    fdd = fdt->fd;          //fd array
     if (!fdd)
-        return 0;
-
+        return NULL;
+        
+    struct file *file;
     bpf_probe_read(&file, sizeof(file), &fdd[fd]);
     if (!file)
-        return 0;
+        return NULL;
 
-    bpf_probe_read(&pos, sizeof(pos), &file->f_pos);
+    return file;
+}
+
+static __always_inline u64 get_file_offset(int fd) {
+    struct file *file = get_file_struct(fd);
+    u64 pos = -1; // start with a invalid position
+    
+    if (file != NULL) {
+        // get file offset
+        bpf_probe_read(&pos, sizeof(pos), &file->f_pos);
+    }
+    
     return pos;
 }
 
-static __always_inline void get_file_path(int fd, char *fname) {
-    struct task_struct *task;
-    struct files_struct *files;
-    struct fdtable *fdt;
-    struct file **fdd;
-    struct file *file;
+static __always_inline struct path_t get_dentry_path(struct dentry *dentry) {
+  struct path_t p = {};
+  struct dentry *d = dentry;
+  
+  for (int i = 0; i < DEFAULT_SUB_BUF_LEN; i++) {
+    // Read the name safely
+    bpf_trace_printk("%s", sizeof(d->d_name.name), d->d_name.name);
+    // bpf_probe_read_kernel(p.data, sizeof(p.data), fname);
     
-    task = (struct task_struct *)bpf_get_current_task();
-    if (!task) {
-        bpf_trace_printk("task is null\n", sizeof("task is null\n"));
-        return;
-    }
-    
-    files = task->files;
-    if (!files) {
-        bpf_trace_printk("files is null\n", sizeof("files is null\n"));
-        return;
-    }
-    
-    fdt = files->fdt;
-    if (!fdt) {
-        bpf_trace_printk("fdt is null\n", sizeof("fdt is null\n"));
-        return;
-    }
-    
-    if (fd >= fdt->max_fds) {
-        bpf_trace_printk("fd too large\n", sizeof("fd too large\n"));
-        return;
-    }
-    
-    fdd = fdt->fd;
-    if (!fdd) {
-        bpf_trace_printk("fdd is null\n", sizeof("fdd is null\n"));
-        return;
-    }
-    
-    bpf_probe_read(&file, sizeof(file), &fdd[fd]);
-    if (!file) {
-        bpf_trace_printk("file is null\n", sizeof("file is null\n"));
-        return;
-    }
-
-    struct dentry *dentry;
-    bpf_probe_read(&dentry, sizeof(dentry), &file->f_path.dentry);
-    if (!dentry) {
-        bpf_trace_printk("dentry is null\n", sizeof("dentry is null\n"));
-        return;
-    }
-
-    // Try to read the name directly from dentry
-    const unsigned char *name;
-    bpf_probe_read(&name, sizeof(name), &dentry->d_name.name);
-    if (!name) {
-        bpf_trace_printk("name pointer is null\n", sizeof("name pointer is null\n"));
-        return;
-    }
-
-    // Read the name string
-    int ret = bpf_probe_read_str(fname, DEFAULT_SUB_BUF_SIZE, name);
-    bpf_trace_printk("read %d bytes for name\n", sizeof("read %d bytes for name\n"), ret);
-    
-    if (ret > 0) {
-        bpf_trace_printk("filename: %s\n", sizeof("filename: %s\n"), fname);
-    } else {
-        bpf_trace_printk("failed to read filename\n", sizeof("failed to read filename\n"));
-    }
+    if (d->d_parent == d) break; // break at root dir
+    d = d->d_parent;
+  }
+  return p;
 }
 
+static __always_inline struct path_t get_file_path(int fd) {
+    struct path_t empty_path = { .data = "" };
+    struct file *file;
+    struct path f_path;
+    
+    file = get_file_struct(fd);
+    if (!file) {
+        return empty_path;
+    }
+    
+    return get_dentry_path(file->f_path.dentry);
+}
 
 int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -159,9 +132,8 @@ int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data->size = count;
     data->offset = get_file_offset(fd);
     
-    // generate filepath
-    get_file_path(fd, data->fname);
-    
+    // char *fname = get_file_path(fd).data;
+    // bpf_probe_read_str(data->fname, sizeof(data->fname), fname);
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
     set_syscall(data, "read");
@@ -186,8 +158,8 @@ int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     data->size = count;
     data->offset = get_file_offset(fd);
     
-    // generate filepath
-    
+    // char *fname = get_file_path(fd).data;
+    // bpf_probe_read_str(data->fname, sizeof(data->fname), fname);
     
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
     set_syscall(data, "read");
