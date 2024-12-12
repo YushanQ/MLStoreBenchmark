@@ -97,7 +97,8 @@ def get_book_dataloader(
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle
+        shuffle=shuffle,
+        pinned_memory=False
     )
 
 # Example tokenizer class (basic implementation)
@@ -124,8 +125,8 @@ class SimpleTokenizer:
 
 
 dataloader = get_book_dataloader(
-    file_path="/home/yushan/llama/sampler_io/simple_book_raw_xlg.txt",
-    batch_size=1024,
+    file_path="/home/yushan/llama/sampler_io/simple_book_raw_lg.txt",
+    batch_size=32,
     sequence_length=50,
     stride=25
 )

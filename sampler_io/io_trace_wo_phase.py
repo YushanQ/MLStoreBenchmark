@@ -5,7 +5,6 @@ import os
 import argparse
 import threading
 from datetime import datetime
-import watchingthread
 
 # BPF program
 bpf_text = """
@@ -13,11 +12,6 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
 #include <linux/fdtable.h>
-
-BPF_PERF_OUTPUT(events);
-#define DEFAULT_SUB_BUF_LEN 16
-#define DEFAULT_SUB_BUF_SIZE 255
-
 
 // Data structure sent to user-space
 struct data_t {
@@ -31,11 +25,7 @@ struct data_t {
     char syscall[8];
 };
 
-struct path_t {
-    char data[256];
-};
-
-BPF_PERCPU_ARRAY(data_map, struct data_t, 1);
+BPF_PERF_OUTPUT(events);
 
 static __always_inline void set_syscall(struct data_t *data, const char *name) {
     #pragma unroll
@@ -44,173 +34,155 @@ static __always_inline void set_syscall(struct data_t *data, const char *name) {
     }
 }
 
-static __always_inline struct file *get_file_struct(int fd) {
+static __always_inline u64 get_file_offset(int fd) {
     struct task_struct *task;
     struct files_struct *files;
     struct fdtable *fdt;
     struct file **fdd;
-    
+    struct file *file;
+    u64 pos = 0;
+
     task = (struct task_struct *)bpf_get_current_task();
     if (!task)
-        return NULL;
-        
+        return 0;
+
     files = task->files;
     if (!files)
-        return NULL;
-        
+        return 0;
+
     fdt = files->fdt;
     if (!fdt)
-        return NULL;
-    
-    if (fd >= fdt->max_fds)
-        return NULL;
+        return 0;
 
-    fdd = fdt->fd;          //fd array
+    if (fd >= fdt->max_fds)
+        return 0;
+
+    fdd = fdt->fd;
     if (!fdd)
-        return NULL;
-        
-    struct file *file;
+        return 0;
+
     bpf_probe_read(&file, sizeof(file), &fdd[fd]);
     if (!file)
-        return NULL;
+        return 0;
 
-    return file;
-}
-
-static __always_inline u64 get_file_offset(int fd) {
-    struct file *file = get_file_struct(fd);
-    u64 pos = -1; // start with a invalid position
-    
-    if (file != NULL) {
-        // get file offset
-        bpf_probe_read(&pos, sizeof(pos), &file->f_pos);
-    }
-    
+    bpf_probe_read(&pos, sizeof(pos), &file->f_pos);
     return pos;
 }
 
-static __always_inline struct path_t get_dentry_path(struct dentry *dentry) {
-  struct path_t p = {};
-  struct dentry *d = dentry;
-  
-  for (int i = 0; i < DEFAULT_SUB_BUF_LEN; i++) {
-    // Read the name safely
-    bpf_trace_printk("%s", sizeof(d->d_name.name), d->d_name.name);
-    // bpf_probe_read_kernel(p.data, sizeof(p.data), fname);
-    
-    if (d->d_parent == d) break; // break at root dir
-    d = d->d_parent;
-  }
-  return p;
-}
-
-static __always_inline struct path_t get_file_path(int fd) {
-    struct path_t empty_path = { .data = "" };
-    struct file *file;
-    struct path f_path;
-    
-    file = get_file_struct(fd);
-    if (!file) {
-        return empty_path;
-    }
-    
-    return get_dentry_path(file->f_path.dentry);
-}
-
-int syscall__read_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
+int syscall__read_enter(struct pt_regs *ctx, struct kiocb *iocb, struct iov_iter *to) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
-    u32 target_pid = LLAMA_PID;
-    
-    if (pid != target_pid) {
-        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-        u32 ppid = task->real_parent->tgid;
-        if (ppid != target_pid) {
-            return 0;
-        }
-    }
-    
-    int mark = 0;
-    struct data_t *data = data_map.lookup(&mark);
-    if (!data)
+    if (pid != MONITOR_PID)
         return 0;
     
-    data->timestamp = bpf_ktime_get_ns();
-    data->pid = pid;
-    data->fd = fd;
-    data->size = count;
-    data->offset = get_file_offset(fd);
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = count;
+    // The current offset before read
+    data.offset = get_file_offset(fd);
     
-    // char *fname = get_file_path(fd).data;
-    // bpf_probe_read_str(data->fname, sizeof(data->fname), fname);
-    
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    set_syscall(data, "read");
-    events.perf_submit(ctx, data, sizeof(*data));
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "read");
+    events.perf_submit(ctx, &data, sizeof(data));
     
     return 0;
 }
 
 int syscall__write_enter(struct pt_regs *ctx, int fd, void *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
-    u32 target_pid = LLAMA_PID;
-    
-    if (pid != target_pid) {
-        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-        u32 ppid = task->real_parent->tgid;
-        if (ppid != target_pid) {
-            return 0;
-        }
-    }
-    
-    int mark = 0;
-    struct data_t *data = data_map.lookup(&mark);
-    if (!data)
+    if (pid != MONITOR_PID)
         return 0;
     
-    data->timestamp = bpf_ktime_get_ns();
-    data->pid = pid;
-    data->fd = fd;
-    data->size = count;
-    data->offset = get_file_offset(fd);
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = count;
+    // The current offset before write
+    data.offset = get_file_offset(fd);
     
-    // char *fname = get_file_path(fd).data;
-    // bpf_probe_read_str(data->fname, sizeof(data->fname), fname);
-    
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    set_syscall(data, "read");
-    events.perf_submit(ctx, data, sizeof(*data));
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "write");
+    events.perf_submit(ctx, &data, sizeof(data));
     
     return 0;
 }
 
-int syscall__open_enter(struct pt_regs *ctx, char *filename, int flags) {
+int syscall__lseek_enter(struct pt_regs *ctx, int fd, off_t offset, int whence) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
-    u32 target_pid = LLAMA_PID;
-    
-    if (pid != target_pid) {
-        struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-        u32 ppid = task->real_parent->tgid;
-        if (ppid != target_pid) {
-            return 0;
-        }
-    }
-    
-    int mark = 0;
-    struct data_t *data = data_map.lookup(&mark);
-    if (!data)
+    if (pid != MONITOR_PID)
         return 0;
     
-    data->timestamp = bpf_ktime_get_ns();
-    data->pid = pid;
-    bpf_probe_read_str(data->fname, sizeof(data->fname), filename);
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = 0;
+    data.offset = offset;
     
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    set_syscall(data, "openat");
-    events.perf_submit(ctx, data, sizeof(*data));
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "lseek");
+    events.perf_submit(ctx, &data, sizeof(data));
     
     return 0;
 }
 
+int syscall__openat_enter(struct pt_regs *ctx, int dirfd, const char *filename, int flags) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != MONITOR_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = dirfd;     
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "openat");
+    bpf_probe_read_user_str(data.fname, 256, filename);
+    
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+
+int syscall__open_enter(struct pt_regs *ctx, const char *filename, int flags) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != MONITOR_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = 0;
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "open");
+    bpf_probe_read_user_str(data.fname, 256, filename);
+    
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+
+int syscall__close_enter(struct pt_regs *ctx, int fd) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != MONITOR_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = fd;
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "close");
+    
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
 """
 
 class IOTracker:
@@ -219,25 +191,31 @@ class IOTracker:
         self.fd_cache_time = {}
         self.start_time = None
         self.time_offset = time.time() - time.monotonic()
-
     def print_event(self, cpu, data, size):
         event = b["events"].event(data)
         syscall = event.syscall.decode('utf-8', 'ignore').strip('\x00')
-
-        # if event.size <= 0 and syscall not in ["lseek", "open", "openat", "open_fd", "openat_fd"]:
-        #     return
-
         fname = event.fname.decode('utf-8', 'ignore').strip('\x00')
 
+        if event.size <= 0 and syscall not in ["lseek", "open", "openat", "open_fd", "openat_fd"]:
+            return
+
         # Print formatted output with offset information
-        if syscall in ["read", "write"]:
+        if syscall == "lseek":
+            print(f"[{event.timestamp}] "
+                  f"{syscall:8}"
+                  f"New Offset: {event.offset}")
+        elif syscall in ["openat", "open"]:
+            print(f"[{event.timestamp}] "
+                f"{syscall:8} {fname:50} ")
+        elif syscall == "close":
+            print(f"[{event.timestamp}] "
+                  f"{syscall:6} /proc/{event.pid}/fd/{event.fd} "
+            )
+        else:
             print(f"[{event.timestamp}] "
                   f"{syscall:6} /proc/{event.pid}/fd/{event.fd} "
                   f"Offset: {event.offset} "
                   f"Size: {event.size} ")
-        elif syscall == "openat":
-            print(f"[{event.timestamp}] "
-                  f"{syscall:6} {event.fname} ")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -247,18 +225,22 @@ def main():
     print("Starting I/O monitoring...")
 
     global b
-    b = BPF(text=bpf_text.replace('LLAMA_PID', args.pid))
+    b = BPF(text=bpf_text.replace('MONITOR_PID', args.pid))
 
     # Attach kprobes
-    b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
-    b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
-    b.attach_kprobe(event="__x64_sys_openat", fn_name="syscall__open_enter")
+    b.attach_kprobe(event="ext4_file_read_iter", fn_name="syscall__read_enter")
+    b.attach_kprobe(event="ext4_file_write_iter", fn_name="syscall__write_enter")
+    b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
+    b.attach_kprobe(event="__x64_sys_open", fn_name="syscall__open_enter")
+    b.attach_kprobe(event="__x64_sys_openat", fn_name="syscall__openat_enter")
+    b.attach_kprobe(event="__x64_sys_close", fn_name="syscall__close_enter")
 
     # Create and setup tracker
     tracker = IOTracker()
     b["events"].open_perf_buffer(tracker.print_event)
 
     print(f"\nTracing I/O for PID {args.pid}... Ctrl+C to stop")
+    print("SYSCALL        FILENAME                        SIZE                OFFSET             LATENCY")
 
     try:
         while True:

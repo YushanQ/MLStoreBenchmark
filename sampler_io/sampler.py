@@ -60,6 +60,8 @@ def test_sampler(dataset: Dataset, sampler_type: str, batch_size: int = 512):
     for batch_idx, batch in enumerate(dataloader):
         if batch_idx % 10 == 0:
             print(f"Processed batch {batch_idx}")
+        if batch_idx > 1:
+            break
 
     print(f"Total time for {sampler_type}: {time.time() - start_time:.2f}s")
 
@@ -68,10 +70,12 @@ def main():
     dataset = WikiTextDataset()
 
     # Test different samplers
-    sampler_types = ["sequential", "random", "weighted"]
+    # sampler_types = ["sequential", "random", "weighted"]
+    sampler_types = ["sequential"]
     for sampler_type in sampler_types:
         print(f"\nTesting {sampler_type} sampler")
         test_sampler(dataset, sampler_type)
+
 
 if __name__ == "__main__":
     main()
