@@ -12,6 +12,7 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
 #include <linux/fdtable.h>
+#include <linux/uio.h>
 
 // Data structure sent to user-space
 struct data_t {
@@ -69,7 +70,7 @@ static __always_inline u64 get_file_offset(int fd) {
     return pos;
 }
 
-int syscall__read_enter(struct pt_regs *ctx, struct kiocb *iocb, struct iov_iter *to) {
+int syscall__read_enter(struct pt_regs *ctx, int fd, char *buf, size_t count) {
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != MONITOR_PID)
         return 0;
@@ -183,6 +184,25 @@ int syscall__close_enter(struct pt_regs *ctx, int fd) {
     events.perf_submit(ctx, &data, sizeof(data));
     return 0;
 }
+
+int ext4__file_open_enter(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != MONITOR_PID)
+        return 0;
+    
+    struct data_t data = {};
+    data.timestamp = bpf_ktime_get_ns();
+    data.pid = pid;
+    data.fd = 0;
+    data.size = 0;
+    
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    set_syscall(&data, "open_ext4");
+    // bpf_probe_read_user_str(data.fname, 256, filename);
+    
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
 """
 
 class IOTracker:
@@ -204,7 +224,7 @@ class IOTracker:
             print(f"[{event.timestamp}] "
                   f"{syscall:8}"
                   f"New Offset: {event.offset}")
-        elif syscall in ["openat", "open"]:
+        elif syscall in ["openat", "open", "open_ext4"]:
             print(f"[{event.timestamp}] "
                 f"{syscall:8} {fname:50} ")
         elif syscall == "close":
@@ -228,12 +248,13 @@ def main():
     b = BPF(text=bpf_text.replace('MONITOR_PID', args.pid))
 
     # Attach kprobes
-    b.attach_kprobe(event="ext4_file_read_iter", fn_name="syscall__read_enter")
-    b.attach_kprobe(event="ext4_file_write_iter", fn_name="syscall__write_enter")
+    b.attach_kprobe(event="__x64_sys_read", fn_name="syscall__read_enter")
+    b.attach_kprobe(event="__x64_sys_write", fn_name="syscall__write_enter")
     b.attach_kprobe(event="__x64_sys_lseek", fn_name="syscall__lseek_enter")
     b.attach_kprobe(event="__x64_sys_open", fn_name="syscall__open_enter")
     b.attach_kprobe(event="__x64_sys_openat", fn_name="syscall__openat_enter")
     b.attach_kprobe(event="__x64_sys_close", fn_name="syscall__close_enter")
+    b.attach_kprobe(event="ext4_file_open", fn_name="ext4__file_open_enter")
 
     # Create and setup tracker
     tracker = IOTracker()
